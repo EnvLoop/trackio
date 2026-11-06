@@ -108,6 +108,7 @@ def main():
     print(
         json.dumps(
             {
+                "trackio": trackio.__version__,
                 "transformers": transformers.__version__,
                 "huggingface_hub": huggingface_hub.__version__,
                 "callback_file": sys.modules[TrackioCallback.__module__].__file__,

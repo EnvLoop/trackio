@@ -246,7 +246,14 @@ class MetricsRepository(RichRepository):
     record_conflict = Conflict
 
     def __init__(
-        self, url, *, initialize=True, schema=None, migrate_from=None, owner_role=None
+        self,
+        url,
+        *,
+        initialize=True,
+        schema=None,
+        migrate_from=None,
+        owner_role=None,
+        _schema_extension=None,
     ):
         if not url.startswith(("sqlite:///", "postgresql+psycopg://")):
             raise ValueError("UNSUPPORTED_DATABASE")
@@ -413,6 +420,8 @@ class MetricsRepository(RichRepository):
                     is None
                 ):
                     raise ValueError("INCOMPLETE_MIGRATION_RECEIPT")
+                if _schema_extension is not None:
+                    _schema_extension(self, connection)
         except BaseException:
             self.engine.dispose()
             raise
@@ -815,9 +824,12 @@ def configured_objects(config):
 def create_app(config, repository=None, *, objects=None):
     objects = objects if objects is not None else configured_objects(config)
     owns_repository = repository is None
-    repository = repository or MetricsRepository(
+    repository = repository or importlib.import_module(
+        "trackio.cloud_workspace"
+    ).WorkspaceRepository(
         config.database_url,
         initialize=config.environment == "local",
+        initialize_workspace=config.environment == "local",
         schema=config.database_schema,
     )
 
@@ -843,6 +855,9 @@ def create_app(config, repository=None, *, objects=None):
                 "status": "ready",
                 "schema_version": SCHEMA_VERSION,
                 "api_version": 1,
+                "workspace_schema_version": 1
+                if hasattr(repository, "workspace")
+                else None,
                 "capabilities": ["runs", "scalar_metrics", "system_metrics", "records"]
                 + (["objects"] if objects is not None else []),
             }
@@ -1102,6 +1117,10 @@ def create_app(config, repository=None, *, objects=None):
         return response
 
     app.add_middleware(BaseHTTPMiddleware, dispatch=no_cache)
+    if hasattr(repository, "workspace"):
+        importlib.import_module("trackio.cloud_workspace_http").install_routes(
+            app, config, repository, objects
+        )
     return app
 
 
@@ -1123,10 +1142,11 @@ def main():
     args = parser.parse_args()
     config = CloudConfig.from_file(args.config)
     if args.initialize or args.migrate_from is not None:
-        MetricsRepository(
+        importlib.import_module("trackio.cloud_workspace").WorkspaceRepository(
             config.database_url,
             schema=config.database_schema,
             initialize=args.initialize,
+            initialize_workspace=True,
             migrate_from=args.migrate_from,
             owner_role=args.owner_role,
         ).close()

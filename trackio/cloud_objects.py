@@ -94,6 +94,34 @@ class FileObjects:
     def delete(self, key):
         self._path(key).unlink(missing_ok=True)
 
+    def inventory(self, scope_digest, *, after=None, limit=100):
+        object_key(scope_digest + "/" + "0" * 64)
+        if after is not None:
+            object_key(after)
+            if not after.startswith(scope_digest + "/"):
+                raise ValueError("INVALID_OBJECT_CURSOR")
+        directory = self.directory / scope_digest
+        if not directory.exists():
+            return {"objects": [], "next": None}
+        self._private_directory(directory)
+        entries = []
+        scanned = 0
+        for path in directory.iterdir():
+            scanned += 1
+            if scanned > 10000:
+                raise ValueError("OBJECT_INVENTORY_SCAN_LIMIT")
+            key = object_key(scope_digest + "/" + path.name)
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("OBJECT_REGULAR_FILE_REQUIRED")
+            if after is None or key > after:
+                entries.append({"key": key, "modified_at": metadata.st_mtime})
+        entries.sort(key=lambda value: value["key"])
+        return {
+            "objects": entries[:limit],
+            "next": entries[limit - 1]["key"] if len(entries) > limit else None,
+        }
+
 
 class S3Objects:
     def __init__(self, client, bucket, prefix):
@@ -130,6 +158,7 @@ class S3Objects:
             or stored.get("Metadata", {}).get("sha256") != digest
         ):
             raise ValueError("OBJECT_UPLOAD_NOT_VERIFIED")
+        self.get(key, digest, len(payload))
 
     def get(self, key, digest, size):
         validate_size(size)
@@ -143,3 +172,30 @@ class S3Objects:
 
     def delete(self, key):
         self.client.delete_object(**self._arguments(key))
+
+    def inventory(self, scope_digest, *, after=None, limit=100):
+        object_key(scope_digest + "/" + "0" * 64)
+        if after is not None and (not object_key(after).startswith(scope_digest + "/")):
+            raise ValueError("INVALID_OBJECT_CURSOR")
+        arguments = {
+            "Bucket": self.bucket,
+            "Prefix": self.prefix + scope_digest + "/",
+            "MaxKeys": limit,
+        }
+        if after is not None:
+            arguments["StartAfter"] = self.prefix + after
+        result = self.client.list_objects_v2(**arguments)
+        values = []
+        for entry in result.get("Contents", []):
+            key = entry["Key"].removeprefix(self.prefix)
+            if not object_key(key).startswith(scope_digest + "/"):
+                raise ValueError("OBJECT_INVENTORY_SCOPE_MISMATCH")
+            values.append(
+                {"key": key, "modified_at": entry["LastModified"].timestamp()}
+            )
+        if len(values) > limit or result.get("IsTruncated") and not values:
+            raise ValueError("INVALID_OBJECT_INVENTORY")
+        return {
+            "objects": values,
+            "next": values[-1]["key"] if result.get("IsTruncated") else None,
+        }

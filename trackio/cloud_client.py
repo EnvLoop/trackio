@@ -16,6 +16,7 @@ import httpx2
 import trackio.apple_gpu as apple_metrics
 import trackio.cpu as cpu_metrics
 import trackio.gpu as gpu_metrics
+from trackio.cloud_artifacts import WorkspaceRunMixin
 from trackio.cloud_rich_client import CloudSummary, RichCloudRun
 
 CONFIG_FIELDS = frozenset(
@@ -83,7 +84,7 @@ class CloudConfig(dict):
         self.run._send()
 
 
-class CloudRun(RichCloudRun):
+class CloudRun(WorkspaceRunMixin, RichCloudRun):
     def __init__(
         self,
         server_url,

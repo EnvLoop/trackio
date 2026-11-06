@@ -77,3 +77,31 @@ def test_s3_content_is_read_back_and_verified_without_accepting_keys_or_urls_fro
         objects.get(key, digest, len(payload))
     objects.delete(key)
     assert storage.deleted["Key"] == "staging/trackio/" + key
+
+
+def test_s3_forged_head_cannot_acknowledge_corrupted_stored_body():
+    from trackio.cloud_objects import S3Objects
+
+    class Storage:
+        def put_object(self, **values):
+            self.values = values
+
+        def head_object(self, **values):
+            return {
+                "ContentLength": len(self.values["Body"]),
+                "Metadata": self.values["Metadata"],
+            }
+
+        def get_object(self, **values):
+            self.body = io.BytesIO(b"X" * len(self.values["Body"]))
+            return {"Body": self.body}
+
+    storage = Storage()
+    objects = S3Objects(storage, "synthetic", "staging/trackio/")
+    payload = b"attachment"
+    digest = hashlib.sha256(payload).hexdigest()
+    with pytest.raises(ValueError, match="OBJECT_INTEGRITY_FAILURE"):
+        objects.put(
+            "a" * 64 + "/" + digest, payload, digest, "application/octet-stream"
+        )
+    assert storage.body.closed
