@@ -9,7 +9,45 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 
-from trackio.cloud import Conflict, MetricsRepository
+from trackio.cloud import SCHEMA_VERSION, Conflict, MetricsRepository
+
+
+def test_explicit_postgres_migration_preserves_bound_run_and_durable_revocation():
+    url = Path(os.environ["TRACKIO_TEST_DATABASE_FILE"]).read_text().strip()
+    address = urlsplit(url)
+    assert address.hostname == "127.0.0.1" and address.path.startswith("/trackio_test_")
+    name = "trackio_test_" + uuid4().hex[:12]
+    repository = MetricsRepository(url, schema=name)
+    identity = repository.bind("w", "p", "j", "r", {})
+    try:
+        with repository.engine.begin() as connection:
+            repository.capabilities.drop(connection)
+            connection.execute(repository.schema.update().values(version=1))
+        with pytest.raises(ValueError, match="SCHEMA_NOT_INITIALIZED_OR_INCOMPATIBLE"):
+            MetricsRepository(url, schema=name, initialize=False)
+        assert not inspect(repository.engine).has_table(
+            "trackio_cloud_capabilities", schema=name
+        )
+        migrated = MetricsRepository(url, schema=name, initialize=False, migrate_from=1)
+        capability = migrated.capability(identity, "t")
+        assert (
+            migrated.authorize_capability(capability["capability_id"])["run_id"] == "r"
+        )
+        migrated.revoke(identity)
+        migrated.close()
+        reopened = MetricsRepository(url, schema=name, initialize=False)
+        with reopened.engine.connect() as connection:
+            assert (
+                connection.execute(reopened.schema.select()).scalar_one()
+                == SCHEMA_VERSION
+            )
+        with pytest.raises(PermissionError, match="REVOKED_OR_EXPIRED"):
+            reopened.authorize_capability(capability["capability_id"])
+        reopened.close()
+    finally:
+        with repository.engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA "{name}" CASCADE'))
+        repository.close()
 
 
 def test_real_postgres_restart_concurrency_and_transaction_rollback():
@@ -92,6 +130,7 @@ def test_named_schema_does_not_touch_platform_tables_and_app_cannot_create_table
             "trackio_cloud_events",
             "trackio_cloud_batches",
             "trackio_cloud_configs",
+            "trackio_cloud_capabilities",
         }
         repository.bind("w", "p", "job", "run", {})
         repository.close()

@@ -66,11 +66,13 @@ class CloudRun:
         spool_dir,
         *,
         trial_id=None,
+        refresh_token=None,
         transport=None,
         max_bytes=16 * 1024 * 1024,
     ):
         self.server_url = server_url.rstrip("/")
         self.token = token
+        self.refresh_token = refresh_token
         self.run_id = run_id
         self.endpoint = self.server_url + "/v1/runs/" + quote(run_id, safe="")
         self.trial_id = trial_id
@@ -79,7 +81,10 @@ class CloudRun:
         self.directory = Path(spool_dir)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         metadata = self.directory.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o700:
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
             raise ValueError("PRIVATE_SPOOL_DIRECTORY_REQUIRED")
         self.transport = transport or httpx2.Client(
             timeout=10, follow_redirects=False, trust_env=False
@@ -184,10 +189,10 @@ class CloudRun:
                 config = config_path.read_bytes() if config_path.exists() else None
                 paths = sorted(self.directory.glob("*.json"))
             if config is not None:
-                response = self.transport.put(
+                response = self._request(
+                    "put",
                     self.endpoint + "/config",
                     json=json.loads(config),
-                    headers={"Authorization": "Bearer " + self.token},
                 )
                 response.raise_for_status()
                 if response.json().get("committed") is not True:
@@ -197,9 +202,9 @@ class CloudRun:
                         config_path.unlink()
             for path in paths:
                 payload = json.loads(path.read_text())
-                response = self.transport.post(
+                response = self._request(
+                    "post",
                     self.endpoint + "/events",
-                    headers={"Authorization": "Bearer " + self.token},
                     json=payload,
                 )
                 response.raise_for_status()
@@ -211,6 +216,30 @@ class CloudRun:
                     raise RuntimeError("INVALID_COMMIT_ACK")
                 with self.lock:
                     path.unlink(missing_ok=True)
+
+    def _request(self, method, endpoint, **kwargs):
+        send = getattr(self.transport, method)
+        response = send(
+            endpoint, headers={"Authorization": "Bearer " + self.token}, **kwargs
+        )
+        if response.status_code == 401 and self.refresh_token:
+            refreshed = self.transport.post(
+                self.server_url + "/v1/capabilities/refresh",
+                headers={"Authorization": "Bearer " + self.refresh_token},
+            )
+            refreshed.raise_for_status()
+            payload = refreshed.json()
+            if (
+                payload.get("run_id") != self.run_id
+                or payload.get("trial_id") != self.trial_id
+                or not isinstance(payload.get("token"), str)
+            ):
+                raise RuntimeError("INVALID_REFRESH_SCOPE")
+            self.token = payload["token"]
+            response = send(
+                endpoint, headers={"Authorization": "Bearer " + self.token}, **kwargs
+            )
+        return response
 
     def finish(self):
         self.flush()
@@ -333,6 +362,7 @@ def init_from_context(path, *, config=None):
         context["run_id"],
         context["spool_dir"],
         trial_id=context.get("trial_id"),
+        refresh_token=context.get("refresh_token"),
     )
     run.config.update(config)
     return run

@@ -85,8 +85,20 @@ idempotency, restart/readback and tenant/Trial filtering against real PostgreSQL
 The platform companion adds browser tests from this SDK through the real HTTP
 service, Worker authorization and the Job metrics page, including offline replay.
 
-Automatic Job controller binding, capability renewal/revocation, recipe activation,
+Access credentials renew using a separate run/Trial-scoped refresh credential.
+The controller fixes the maximum renewal deadline at binding time; the service
+persists revocation and checks it inside each write transaction. Revocation
+survives service restart and immediately invalidates both access and refresh.
+Refresh cannot query metrics or issue another run's credentials.
+
+Schema version 2 adds persistent capabilities. Existing version 1 installations
+must stop the metrics service and explicitly run `--migrate-from 1` using the
+migration identity and, where configured, `--owner-role`. Ordinary startup
+rejects mismatched versions without modifying tables. The application identity
+requires DML only; staging/prod also require an explicit private PostgreSQL schema.
+
+Automatic Job controller binding, recipe activation,
 object storage and SQLite import, quotas/retention, platform release/deployment
 integration and production operational acceptance are still required. A one-hour
-test capability is not a complete long-running training credential lifecycle.
+test capability does not establish controller integration or terminal revocation.
 Do not deploy this incremental implementation as the completed integration.

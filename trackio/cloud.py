@@ -7,6 +7,7 @@ import hmac
 import json
 import math
 import re
+import secrets
 import stat
 import sys
 import time
@@ -23,8 +24,11 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    UniqueConstraint,
     create_engine,
+    inspect,
     select,
+    text,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.schema import CreateSchema
@@ -38,7 +42,7 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_EVENTS = 256
 MAX_BODY = 1024 * 1024
 
@@ -174,7 +178,15 @@ def validate_schema(value):
 
 
 def issue_token(
-    key, workspace_id, project_id, job_id, run_id, *, expires_at, trial_id=None
+    key,
+    workspace_id,
+    project_id,
+    job_id,
+    run_id,
+    *,
+    expires_at,
+    trial_id=None,
+    capability_id=None,
 ):
     claims = dict(
         workspace_id=workspace_id,
@@ -184,6 +196,7 @@ def issue_token(
         trial_id=trial_id,
         expires_at=expires_at,
         version=1,
+        capability_id=capability_id,
     )
     payload = base64.urlsafe_b64encode(canonical(claims).encode()).decode().rstrip("=")
     signature = hmac.new(key.encode(), payload.encode(), hashlib.sha256).hexdigest()
@@ -217,7 +230,9 @@ class Conflict(ValueError):
 
 
 class MetricsRepository:
-    def __init__(self, url, *, initialize=True, schema=None):
+    def __init__(
+        self, url, *, initialize=True, schema=None, migrate_from=None, owner_role=None
+    ):
         if not url.startswith(("sqlite:///", "postgresql+psycopg://")):
             raise ValueError("UNSUPPORTED_DATABASE")
         self.url = url
@@ -274,22 +289,163 @@ class MetricsRepository:
             Column("run_id", String(256), primary_key=True),
             Column("payload", Text, nullable=False),
         )
-        if initialize:
-            if schema is not None:
-                with self.engine.begin() as connection:
+        self.capabilities = Table(
+            "trackio_cloud_capabilities",
+            metadata,
+            Column("capability_id", String(64), primary_key=True),
+            Column("run_id", String(256), nullable=False, index=True),
+            Column("trial_key", String(256), nullable=False),
+            Column("renew_until", Float, nullable=False),
+            Column("revoked", Integer, nullable=False),
+            UniqueConstraint("run_id", "trial_key"),
+        )
+        try:
+            with self.engine.begin() as connection:
+                if schema is not None and initialize:
                     connection.execute(CreateSchema(schema, if_not_exists=True))
-            metadata.create_all(self.engine)
-        with self.engine.begin() as connection:
-            versions = connection.execute(select(self.schema.c.version)).scalars().all()
-            if versions and versions != [SCHEMA_VERSION]:
-                raise ValueError("INCOMPATIBLE_SCHEMA")
-            if not versions and initialize:
-                connection.execute(self.schema.insert().values(version=SCHEMA_VERSION))
-            elif not versions:
-                raise ValueError("SCHEMA_NOT_INITIALIZED")
+                if owner_role is not None:
+                    validate_schema(owner_role)
+                    if not url.startswith("postgresql+psycopg://") or not (
+                        initialize or migrate_from
+                    ):
+                        raise ValueError("EXPLICIT_POSTGRESQL_DDL_REQUIRED")
+                    connection.execute(text(f'SET LOCAL ROLE "{owner_role}"'))
+                known = inspect(connection).has_table(self.schema.name, schema=schema)
+                versions = (
+                    connection.execute(select(self.schema.c.version)).scalars().all()
+                    if known
+                    else []
+                )
+                if migrate_from is not None:
+                    if migrate_from != 1 or versions != [migrate_from]:
+                        raise ValueError("INCOMPATIBLE_MIGRATION_SOURCE")
+                    metadata.create_all(connection)
+                    connection.execute(
+                        self.schema.update().values(version=SCHEMA_VERSION)
+                    )
+                elif initialize:
+                    if versions and versions != [SCHEMA_VERSION]:
+                        raise ValueError("INCOMPATIBLE_SCHEMA")
+                    metadata.create_all(connection)
+                    if not versions:
+                        connection.execute(
+                            self.schema.insert().values(version=SCHEMA_VERSION)
+                        )
+                elif versions != [SCHEMA_VERSION]:
+                    raise ValueError("SCHEMA_NOT_INITIALIZED_OR_INCOMPATIBLE")
+                if any(
+                    not inspect(connection).has_table(table.name, schema=schema)
+                    for table in metadata.tables.values()
+                ):
+                    raise ValueError("INCOMPLETE_SCHEMA")
+        except BaseException:
+            self.engine.dispose()
+            raise
 
     def close(self):
         self.engine.dispose()
+
+    def capability(self, identity, trial_id, renew_until=None):
+        now = time.time()
+        if trial_id is not None:
+            identifier(trial_id)
+        if renew_until is not None and (
+            not finite(renew_until) or not now < renew_until <= now + 604800
+        ):
+            raise ValueError("INVALID_CAPABILITY_DEADLINE")
+        with self.engine.begin() as connection:
+            matched = connection.execute(
+                self.runs.update()
+                .where(
+                    *[
+                        self.runs.c[key] == identity[key]
+                        for key in ("workspace_id", "project_id", "job_id", "run_id")
+                    ]
+                )
+                .values(updated_at=now)
+            )
+            if matched.rowcount != 1:
+                raise PermissionError("RUN_SCOPE_MISMATCH")
+            row = (
+                connection.execute(
+                    select(self.capabilities).where(
+                        self.capabilities.c.run_id == identity["run_id"],
+                        self.capabilities.c.trial_key == (trial_id or ""),
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                values = dict(
+                    capability_id=secrets.token_hex(32),
+                    run_id=identity["run_id"],
+                    trial_key=trial_id or "",
+                    renew_until=renew_until or now + 3600,
+                    revoked=0,
+                )
+                connection.execute(self.capabilities.insert().values(**values))
+                row = values
+            elif renew_until is not None and row["renew_until"] != renew_until:
+                raise Conflict("CAPABILITY_DEADLINE_IS_IMMUTABLE")
+            if row["revoked"] or row["renew_until"] <= now:
+                raise PermissionError("CAPABILITY_REVOKED_OR_EXPIRED")
+            return {
+                **identity,
+                "trial_id": trial_id,
+                "capability_id": row["capability_id"],
+                "renew_until": row["renew_until"],
+            }
+
+    def authorize_capability(self, capability_id):
+        with self.engine.connect() as connection:
+            row = (
+                connection.execute(
+                    select(
+                        self.capabilities,
+                        self.runs.c.workspace_id,
+                        self.runs.c.project_id,
+                        self.runs.c.job_id,
+                    )
+                    .join(self.runs, self.capabilities.c.run_id == self.runs.c.run_id)
+                    .where(self.capabilities.c.capability_id == capability_id)
+                )
+                .mappings()
+                .first()
+            )
+        if row is None or row["revoked"] or row["renew_until"] <= time.time():
+            raise PermissionError("CAPABILITY_REVOKED_OR_EXPIRED")
+        return {
+            key: row[key]
+            for key in (
+                "capability_id",
+                "run_id",
+                "workspace_id",
+                "project_id",
+                "job_id",
+                "renew_until",
+            )
+        } | {"trial_id": row["trial_key"] or None}
+
+    def revoke(self, identity):
+        with self.engine.begin() as connection:
+            matched = connection.execute(
+                self.runs.update()
+                .where(
+                    *[
+                        self.runs.c[key] == identity[key]
+                        for key in ("workspace_id", "project_id", "job_id", "run_id")
+                    ]
+                )
+                .values(updated_at=time.time())
+            )
+            if matched.rowcount != 1:
+                raise PermissionError("RUN_SCOPE_MISMATCH")
+            connection.execute(
+                self.capabilities.update()
+                .where(self.capabilities.c.run_id == identity["run_id"])
+                .values(revoked=1)
+            )
 
     def bind(self, workspace_id, project_id, job_id, run_id, config):
         identity = {
@@ -323,7 +479,23 @@ class MetricsRepository:
                     raise Conflict("RUN_BINDING_CONFLICT") from None
         return identity
 
-    def append(self, workspace_id, project_id, job_id, run_id, batch):
+    def _live_capability(self, connection, capability_id, run_id):
+        row = (
+            connection.execute(
+                select(self.capabilities).where(
+                    self.capabilities.c.capability_id == capability_id,
+                    self.capabilities.c.run_id == run_id,
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if row is None or row["revoked"] or row["renew_until"] <= time.time():
+            raise PermissionError("CAPABILITY_REVOKED_OR_EXPIRED")
+
+    def append(
+        self, workspace_id, project_id, job_id, run_id, batch, capability_id=None
+    ):
         validate_batch(batch)
         digest = hashlib.sha256(canonical(batch).encode()).hexdigest()
         with self.engine.begin() as connection:
@@ -339,6 +511,8 @@ class MetricsRepository:
             ).rowcount
             if matched != 1:
                 raise PermissionError("RUN_SCOPE_MISMATCH")
+            if capability_id is not None:
+                self._live_capability(connection, capability_id, run_id)
             previous = connection.execute(
                 select(self.batches.c.digest).where(
                     self.batches.c.run_id == run_id,
@@ -434,6 +608,10 @@ class MetricsRepository:
             ).rowcount
             if matched != 1:
                 raise PermissionError("RUN_SCOPE_MISMATCH")
+            if claims.get("capability_id") is not None:
+                self._live_capability(
+                    connection, claims["capability_id"], claims["run_id"]
+                )
             previous = connection.execute(
                 select(self.configs.c.payload).where(
                     self.configs.c.run_id == claims["run_id"]
@@ -497,18 +675,71 @@ def create_app(config, repository=None):
                 for key in ("workspace_id", "project_id", "job_id", "run_id", "config")
             }
         )
-        expires_at = time.time() + config.token_ttl
+        capability = repository.capability(
+            identity, data.get("trial_id"), data.get("renew_until")
+        )
+        return JSONResponse(tokens(capability))
+
+    def refresh_secret(capability_id):
+        return (
+            capability_id
+            + "."
+            + hmac.new(
+                config.signing_key.encode(),
+                ("trackio:refresh:" + capability_id).encode(),
+                hashlib.sha256,
+            ).hexdigest()
+        )
+
+    def tokens(capability):
+        expires_at = min(time.time() + config.token_ttl, capability["renew_until"])
         token = issue_token(
             config.signing_key,
-            **identity,
+            **{
+                key: capability[key]
+                for key in ("workspace_id", "project_id", "job_id", "run_id")
+            },
             expires_at=expires_at,
-            trial_id=data.get("trial_id"),
+            trial_id=capability["trial_id"],
+            capability_id=capability["capability_id"],
         )
-        return JSONResponse({**identity, "token": token, "expires_at": expires_at})
+        return {
+            **capability,
+            "token": token,
+            "expires_at": expires_at,
+            "refresh_token": refresh_secret(capability["capability_id"]),
+        }
+
+    def authorized(request):
+        claims = verify_token(
+            config.signing_key,
+            request.headers.get("authorization", "").removeprefix("Bearer "),
+        )
+        capability = repository.authorize_capability(claims.get("capability_id"))
+        if any(
+            claims.get(key) != capability.get(key)
+            for key in ("run_id", "workspace_id", "project_id", "job_id", "trial_id")
+        ):
+            raise PermissionError("CAPABILITY_SCOPE_MISMATCH")
+        return claims
+
+    async def refresh(request):
+        raw = request.headers.get("authorization", "").removeprefix("Bearer ")
+        capability_id = raw.partition(".")[0]
+        if not hmac.compare_digest(raw, refresh_secret(capability_id)):
+            raise PermissionError("INVALID_REFRESH_CAPABILITY")
+        return JSONResponse(tokens(repository.authorize_capability(capability_id)))
+
+    async def revoke(request):
+        service(request)
+        identity = await body(request)
+        if identity["run_id"] != request.path_params["run_id"]:
+            raise PermissionError("RUN_SCOPE_MISMATCH")
+        repository.revoke(identity)
+        return JSONResponse({"revoked": True})
 
     async def append(request):
-        raw = request.headers.get("authorization", "").removeprefix("Bearer ")
-        claims = verify_token(config.signing_key, raw)
+        claims = authorized(request)
         if claims["run_id"] != request.path_params["run_id"]:
             return JSONResponse({"error": "RUN_SCOPE_MISMATCH"}, status_code=403)
         data = await body(request)
@@ -523,6 +754,7 @@ def create_app(config, repository=None):
                 for key in ("workspace_id", "project_id", "job_id", "run_id")
             },
             batch=data,
+            capability_id=claims["capability_id"],
         )
         return JSONResponse(
             {"batch_id": data["batch_id"], "accepted": accepted, "committed": True}
@@ -544,10 +776,7 @@ def create_app(config, repository=None):
         return JSONResponse({"events": events[:2000], "truncated": len(events) > 2000})
 
     async def update_config(request):
-        claims = verify_token(
-            config.signing_key,
-            request.headers.get("authorization", "").removeprefix("Bearer "),
-        )
+        claims = authorized(request)
         if claims["run_id"] != request.path_params["run_id"]:
             raise PermissionError("RUN_SCOPE_MISMATCH")
         repository.update_config(claims, await body(request))
@@ -596,6 +825,8 @@ def create_app(config, repository=None):
             Route("/v1/runs/{run_id}/events", append, methods=["POST"]),
             Route("/v1/metrics", query),
             Route("/v1/runs/{run_id}/config", update_config, methods=["PUT"]),
+            Route("/v1/capabilities/refresh", refresh, methods=["POST"]),
+            Route("/v1/runs/{run_id}/revoke", revoke, methods=["POST"]),
         ],
         exception_handlers={
             ValueError: error,
@@ -619,15 +850,24 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=18763, type=int)
-    parser.add_argument(
+    schema_action = parser.add_mutually_exclusive_group()
+    schema_action.add_argument(
         "--initialize",
         action="store_true",
         help="Explicitly initialize the additive schema, then exit",
     )
+    schema_action.add_argument("--migrate-from", choices=[1], type=int)
+    parser.add_argument("--owner-role")
     args = parser.parse_args()
     config = CloudConfig.from_file(args.config)
-    if args.initialize:
-        MetricsRepository(config.database_url, schema=config.database_schema).close()
+    if args.initialize or args.migrate_from is not None:
+        MetricsRepository(
+            config.database_url,
+            schema=config.database_schema,
+            initialize=args.initialize,
+            migrate_from=args.migrate_from,
+            owner_role=args.owner_role,
+        ).close()
         return
     uvicorn.run(
         create_app(config),
