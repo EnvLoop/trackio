@@ -31,6 +31,7 @@ from trackio.api import Api
 from trackio.apple_gpu import apple_gpu_available
 from trackio.apple_gpu import log_apple_gpu as _log_apple_gpu
 from trackio.artifact import Artifact
+from trackio.cloud_client import init_from_context
 from trackio.console import resolve_capture_console
 from trackio.cpu import cpu_available
 from trackio.cpu import log_cpu as _log_cpu
@@ -420,6 +421,17 @@ def init(
     Returns:
         `Run`: A [`Run`] object that can be used to log metrics and finish the run.
     """
+    if context_file := os.environ.get("TRACKIO_ENVLOOP_CONTEXT_FILE"):
+        if space_id or dataset_id or bucket_id or server_url or os.environ.get("TRACKIO_SPACE_ID"):
+            raise ValueError("ENVLOOP_METRICS_DESTINATION_IS_PLATFORM_BOUND")
+        if context_vars.current_run.get() is not None:
+            raise RuntimeError("Finish the active Trackio run before initializing another")
+        run = init_from_context(context_file, config=config)
+        context_vars.current_run.set(run)
+        context_vars.current_project.set(project)
+        context_vars.current_space_id.set(None)
+        globals()["config"] = run.config
+        return run
     SQLiteStorage.validate_project_name(project)
 
     if settings is not None:

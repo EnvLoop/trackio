@@ -13,7 +13,7 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "huggingface-hub>=1.31.0,<3",
+    "huggingface-hub>=1.31.0,<2",
     "httpx2>=2.0.0,<3",
     "starlette<2.0.0",
     "python-multipart>=0.0.9,<1.0.0",
@@ -41,6 +41,7 @@ dev = [
     "pytest>=8.0.0,<10.0.0",
     "playwright==1.60.0",
     "pytest-playwright>=0.7.0,<1.0.0",
+    "httpx>=0.28,<1",
 ]
 tensorboard = [
     "tbparse==0.0.9",
@@ -61,6 +62,10 @@ spaces = [
 ]
 mcp = [
     "mcp>=1.30.0,<3.0.0",
+]
+cloud = [
+    "psycopg[binary]==3.3.6 ; python_full_version >= '3.11'",
+    "sqlalchemy==2.1.6 ; python_full_version >= '3.11'",
 ]
 
 [project.scripts]
