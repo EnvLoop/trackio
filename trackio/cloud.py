@@ -38,6 +38,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from trackio import cloud_server
 from trackio.cloud_objects import MAX_OBJECT_BYTES
 from trackio.cloud_records import RichRepository, rich_tables
 
@@ -1130,9 +1131,7 @@ def main():
             owner_role=args.owner_role,
         ).close()
         return
-    from trackio.cloud_server import tls_options
-
-    options = tls_options(args.config)
+    options = cloud_server.tls_options(args.config)
     uvicorn.run(
         create_app(config),
         host=args.host,
