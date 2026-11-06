@@ -4,6 +4,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import importlib
 import json
 import math
 import re
@@ -34,15 +35,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.schema import CreateSchema
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
+
+from trackio.cloud_objects import MAX_OBJECT_BYTES
+from trackio.cloud_records import RichRepository, rich_tables
 
 if sys.version_info >= (3, 11):
     import tomllib
 else:
     import tomli as tomllib
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_EVENTS = 256
 MAX_BODY = 1024 * 1024
 REVOKED_RUN_TRIAL = "__trackio_run_revoked__"
@@ -120,6 +124,7 @@ class CloudConfig:
     signing_key: str = field(repr=False)
     token_ttl: int = 3600
     database_schema: str | None = None
+    objects_config_file: str | None = field(default=None, repr=False)
 
     def __post_init__(self):
         if self.environment not in ("local", "staging", "prod"):
@@ -164,6 +169,9 @@ class CloudConfig:
             signing_key=private_text(path.parent / raw["signing_key_file"]),
             token_ttl=raw.get("token_ttl", 3600),
             database_schema=raw.get("database_schema"),
+            objects_config_file=str(path.parent / raw["objects_config_file"])
+            if raw.get("objects_config_file")
+            else None,
         )
 
 
@@ -230,7 +238,12 @@ class Conflict(ValueError):
     pass
 
 
-class MetricsRepository:
+class MetricsRepository(RichRepository):
+    document_json = staticmethod(canonical)
+    validate_identity = staticmethod(identifier)
+    is_finite = staticmethod(finite)
+    record_conflict = Conflict
+
     def __init__(
         self, url, *, initialize=True, schema=None, migrate_from=None, owner_role=None
     ):
@@ -307,8 +320,21 @@ class MetricsRepository:
             Column("applied_at", Float, nullable=False),
             Column("legacy_tokens_until", Float),
         )
+        self.objects, self.documents = rich_tables(metadata)
         try:
             with self.engine.begin() as connection:
+                if url.startswith("postgresql+psycopg://") and (
+                    initialize or migrate_from
+                ):
+                    lock_id = int.from_bytes(
+                        hashlib.sha256((schema or "public").encode()).digest()[:8],
+                        "big",
+                        signed=True,
+                    )
+                    connection.execute(
+                        text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                        {"lock_id": lock_id},
+                    )
                 if schema is not None and initialize:
                     connection.execute(CreateSchema(schema, if_not_exists=True))
                 if owner_role is not None:
@@ -325,14 +351,23 @@ class MetricsRepository:
                     else []
                 )
                 if migrate_from is not None:
-                    if migrate_from != 1 or versions != [migrate_from]:
+                    if migrate_from not in (1, 2) or versions != [migrate_from]:
                         raise ValueError("INCOMPATIBLE_MIGRATION_SOURCE")
+                    legacy_until = (
+                        time.time() + 86400
+                        if migrate_from == 1
+                        else connection.execute(
+                            select(self.migrations.c.legacy_tokens_until).where(
+                                self.migrations.c.version == migrate_from
+                            )
+                        ).scalar_one()
+                    )
                     metadata.create_all(connection)
                     connection.execute(
                         self.migrations.insert().values(
                             version=SCHEMA_VERSION,
                             applied_at=time.time(),
-                            legacy_tokens_until=time.time() + 86400,
+                            legacy_tokens_until=legacy_until,
                         )
                     )
                     connection.execute(
@@ -742,7 +777,42 @@ class MetricsRepository:
                 )
 
 
-def create_app(config, repository=None):
+def configured_objects(config):
+    if config.objects_config_file is None:
+        return None
+    path = Path(config.objects_config_file)
+
+    def private_file(filename):
+        value = path.parent / filename
+        metadata = value.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ValueError("PRIVATE_OBJECT_CONFIG_REQUIRED")
+        return value.read_text().strip()
+
+    settings = tomllib.loads(private_file(path.name))
+    if settings["backend"] == "file":
+        if config.environment != "local":
+            raise ValueError("MANAGED_OBJECT_STORAGE_REQUIRED")
+        return importlib.import_module("trackio.cloud_objects").FileObjects(
+            path.parent / settings["directory"]
+        )
+    if settings["backend"] != "s3" or (
+        config.environment != "local"
+        and config.environment not in settings["prefix"].split("/")
+    ):
+        raise ValueError("ENVIRONMENT_OBJECT_PREFIX_REQUIRED")
+    credentials = {
+        key: private_file(settings[key + "_file"])
+        for key in ("access_key_id", "secret_access_key")
+    }
+    return importlib.import_module("trackio.cloud_s3").s3_objects(settings, credentials)
+
+
+def create_app(config, repository=None, *, objects=None):
+    objects = objects if objects is not None else configured_objects(config)
     owns_repository = repository is None
     repository = repository or MetricsRepository(
         config.database_url,
@@ -772,7 +842,8 @@ def create_app(config, repository=None):
                 "status": "ready",
                 "schema_version": SCHEMA_VERSION,
                 "api_version": 1,
-                "capabilities": ["runs", "scalar_metrics", "system_metrics"],
+                "capabilities": ["runs", "scalar_metrics", "system_metrics", "records"]
+                + (["objects"] if objects is not None else []),
             }
         )
 
@@ -896,6 +967,74 @@ def create_app(config, repository=None):
         repository.update_config(claims, await body(request))
         return JSONResponse({"committed": True})
 
+    async def upload_object(request):
+        claims = authorized(request)
+        if claims["run_id"] != request.path_params["run_id"]:
+            raise PermissionError("RUN_SCOPE_MISMATCH")
+        payload = bytearray()
+        async for chunk in request.stream():
+            payload.extend(chunk)
+            if len(payload) > MAX_OBJECT_BYTES:
+                raise ValueError("OBJECT_TOO_LARGE")
+        repository.put_object(
+            claims,
+            request.path_params["digest"],
+            bytes(payload),
+            request.headers.get("content-type", "application/octet-stream"),
+            objects,
+        )
+        return JSONResponse(
+            {"committed": True, "digest": request.path_params["digest"]}
+        )
+
+    async def append_record(request):
+        claims = authorized(request)
+        if claims["run_id"] != request.path_params["run_id"]:
+            raise PermissionError("RUN_SCOPE_MISMATCH")
+        record = await body(request)
+        accepted = repository.append_record(claims, record)
+        return JSONResponse(
+            {"committed": True, "record_id": record["record_id"], "accepted": accepted}
+        )
+
+    def read_scope(request):
+        service(request)
+        return {
+            key: identifier(request.query_params[key])
+            for key in ("workspace_id", "project_id", "job_id", "run_id")
+        }
+
+    async def query_records(request):
+        rows = repository.read_records(
+            read_scope(request),
+            request.query_params.get("kind"),
+            request.query_params.get("after"),
+        )
+        return JSONResponse(
+            {
+                "records": rows[:500],
+                "truncated": len(rows) > 500,
+                "next": rows[499]["record_id"] if len(rows) > 500 else None,
+            }
+        )
+
+    async def download_object(request):
+        scope = read_scope(request)
+        if scope["run_id"] != request.path_params["run_id"]:
+            raise PermissionError("RUN_SCOPE_MISMATCH")
+        payload = repository.read_object(scope, request.path_params["digest"], objects)
+        return Response(
+            payload,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": 'attachment; filename="'
+                + request.path_params["digest"]
+                + '"',
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "sandbox; default-src 'none'",
+            },
+        )
+
     async def forbidden(request):
         raise PermissionError("SERVICE_AUTH_REQUIRED")
 
@@ -941,6 +1080,12 @@ def create_app(config, repository=None):
             Route("/v1/runs/{run_id}/config", update_config, methods=["PUT"]),
             Route("/v1/capabilities/refresh", refresh, methods=["POST"]),
             Route("/v1/runs/{run_id}/revoke", revoke, methods=["POST"]),
+            Route("/v1/runs/{run_id}/objects/{digest}", upload_object, methods=["PUT"]),
+            Route(
+                "/v1/runs/{run_id}/objects/{digest}", download_object, methods=["GET"]
+            ),
+            Route("/v1/runs/{run_id}/records", append_record, methods=["POST"]),
+            Route("/v1/records", query_records, methods=["GET"]),
         ],
         exception_handlers={
             ValueError: error,

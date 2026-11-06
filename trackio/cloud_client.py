@@ -16,6 +16,7 @@ import httpx2
 import trackio.apple_gpu as apple_metrics
 import trackio.cpu as cpu_metrics
 import trackio.gpu as gpu_metrics
+from trackio.cloud_rich_client import CloudSummary, RichCloudRun
 
 CONFIG_FIELDS = frozenset(
     {
@@ -82,7 +83,7 @@ class CloudConfig(dict):
         self.run._send()
 
 
-class CloudRun:
+class CloudRun(RichCloudRun):
     def __init__(
         self,
         server_url,
@@ -100,6 +101,8 @@ class CloudRun:
         self.token = token
         self.refresh_token = refresh_token
         self.run_id = run_id
+        self.closed = False
+        self.summary = CloudSummary(self)
         self.endpoint = self.server_url + "/v1/runs/" + quote(run_id, safe="")
         self.trial_id = trial_id
         if categories is not None and (
@@ -158,7 +161,20 @@ class CloudRun:
             temporary.unlink(missing_ok=True)
 
     def log(self, metrics, step=None):
-        return self._log(metrics, step, "experiment")
+        if not isinstance(metrics, dict) or not metrics:
+            raise ValueError("METRICS_DICTIONARY_REQUIRED")
+        scalar = {
+            key: value for key, value in metrics.items() if type(value) in (int, float)
+        }
+        rich = {key: value for key, value in metrics.items() if key not in scalar}
+        if scalar:
+            self._log(scalar, step, "experiment")
+        if rich and "experiment" in self.categories:
+            self.queue_record(
+                "history",
+                rich,
+                step if step is not None else scalar.get("train/global_step"),
+            )
 
     def log_system(self, metrics):
         if "compute" not in self.categories:
@@ -243,6 +259,12 @@ class CloudRun:
                         config_path.unlink()
             for path in paths:
                 payload = json.loads(path.read_text())
+                if "record" in payload:
+                    self._flush_record(payload)
+                    with self.lock:
+                        path.unlink(missing_ok=True)
+                        self._collect_spool_objects()
+                    continue
                 response = self._request(
                     "post",
                     self.endpoint + "/events",
@@ -260,8 +282,11 @@ class CloudRun:
 
     def _request(self, method, endpoint, **kwargs):
         send = getattr(self.transport, method)
+        headers = kwargs.pop("headers", {})
         response = send(
-            endpoint, headers={"Authorization": "Bearer " + self.token}, **kwargs
+            endpoint,
+            headers={**headers, "Authorization": "Bearer " + self.token},
+            **kwargs,
         )
         if response.status_code == 401 and self.refresh_token:
             refreshed = self.transport.post(
@@ -278,7 +303,9 @@ class CloudRun:
                 raise RuntimeError("INVALID_REFRESH_SCOPE")
             self.token = payload["token"]
             response = send(
-                endpoint, headers={"Authorization": "Bearer " + self.token}, **kwargs
+                endpoint,
+                headers={**headers, "Authorization": "Bearer " + self.token},
+                **kwargs,
             )
         return response
 
@@ -368,7 +395,7 @@ class ManagedCloudRun(CloudRun):
                 self.wake.clear()
                 try:
                     self.flush()
-                except (OSError, httpx2.HTTPError, RuntimeError):
+                except (OSError, httpx2.HTTPError, RuntimeError, ValueError):
                     self.delivery_status["committed"] = False
                     self.stopped.wait(1)
         finally:
@@ -380,7 +407,13 @@ class ManagedCloudRun(CloudRun):
             with self.lock:
                 if not self.closed:
                     super()._log(*args)
-        except (OSError, BufferError):
+        except (OSError, BufferError, ValueError):
+            self._record_gap()
+
+    def queue_record(self, *args, **kwargs):
+        try:
+            super().queue_record(*args, **kwargs)
+        except ValueError:
             self._record_gap()
 
     def _record_gap(self):

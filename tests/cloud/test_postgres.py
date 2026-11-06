@@ -5,11 +5,65 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 
 from trackio.cloud import SCHEMA_VERSION, Conflict, MetricsRepository
+
+
+def test_real_postgres_additive_v2_migration_keeps_app_grants_and_serializes_owner():
+    url = Path(os.environ["TRACKIO_TEST_DATABASE_FILE"]).read_text().strip()
+    assert urlsplit(url).hostname == "127.0.0.1"
+    name = "trackio_test_" + uuid4().hex[:12]
+    repository = MetricsRepository(url, schema=name)
+    identity = repository.bind("w", "p", "j", "r", {})
+    capability = repository.capability(identity, "t")
+    try:
+        with repository.engine.begin() as connection:
+            repository.objects.drop(connection)
+            repository.documents.drop(connection)
+            connection.execute(repository.schema.update().values(version=2))
+            connection.execute(
+                repository.migrations.update().values(
+                    version=2, legacy_tokens_until=1234
+                )
+            )
+
+        def migrate():
+            try:
+                upgraded = MetricsRepository(
+                    url, schema=name, initialize=False, migrate_from=2
+                )
+            except ValueError as error:
+                assert str(error) == "INCOMPATIBLE_MIGRATION_SOURCE"
+                return False
+            upgraded.close()
+            return True
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert sum(pool.map(lambda _: migrate(), range(2))) == 1
+        upgraded = MetricsRepository(url, schema=name, initialize=False)
+        try:
+            assert (
+                upgraded.authorize_capability(capability["capability_id"])["trial_id"]
+                == "t"
+            )
+            with upgraded.engine.connect() as connection:
+                assert (
+                    connection.execute(
+                        select(upgraded.migrations.c.legacy_tokens_until).where(
+                            upgraded.migrations.c.version == SCHEMA_VERSION
+                        )
+                    ).scalar_one()
+                    == 1234
+                )
+        finally:
+            upgraded.close()
+    finally:
+        with repository.engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA "{name}" CASCADE'))
+        repository.close()
 
 
 def test_explicit_postgres_migration_preserves_bound_run_and_durable_revocation():
@@ -133,6 +187,8 @@ def test_named_schema_does_not_touch_platform_tables_and_app_cannot_create_table
             "trackio_cloud_configs",
             "trackio_cloud_capabilities",
             "trackio_cloud_migrations",
+            "trackio_cloud_objects",
+            "trackio_cloud_records",
         }
         repository.bind("w", "p", "job", "run", {})
         repository.close()

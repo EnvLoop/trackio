@@ -194,7 +194,7 @@ def test_expired_token_and_unsupported_operations(cloud):
         ).status_code
         == 404
     )
-    assert client.get("/ready").json()["schema_version"] == 2
+    assert client.get("/ready").json()["schema_version"] == 3
 
 
 def test_repository_restart_persists_and_config_is_validated(tmp_path):
