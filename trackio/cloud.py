@@ -1130,11 +1130,15 @@ def main():
             owner_role=args.owner_role,
         ).close()
         return
+    from trackio.cloud_server import tls_options
+
+    options = tls_options(args.config)
     uvicorn.run(
         create_app(config),
         host=args.host,
         port=args.port,
         access_log=False,
+        **options,
     )
 
 
