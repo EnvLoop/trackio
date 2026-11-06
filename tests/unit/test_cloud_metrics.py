@@ -128,6 +128,22 @@ def test_commit_ack_replay_conflict_and_scope(cloud):
     assert repository.events("w2", "p1", "job1") == []
 
 
+def test_integer_valued_float_replay_preserves_numeric_identity(cloud):
+    client, repository, _ = cloud
+    binding = bind(client)
+    headers = {"Authorization": "Bearer " + binding["token"]}
+    original = batch(12.0)
+    replay = batch(12)
+    assert (
+        client.post("/v1/runs/run1/events", json=original, headers=headers).status_code
+        == 200
+    )
+    response = client.post("/v1/runs/run1/events", json=replay, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["accepted"] == 0
+    assert len(repository.events("w1", "p1", "job1")) == 1
+
+
 def test_atomic_batch_and_immutable_binding(cloud):
     client, repository, _ = cloud
     run = bind(client)
