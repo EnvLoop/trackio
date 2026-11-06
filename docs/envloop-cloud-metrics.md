@@ -74,9 +74,9 @@ Each spool is for one reporting process. Distributed writers need separate spool
 
 ```sh
 uv sync --locked --extra cloud --extra dev
-python -m pytest tests/unit/test_cloud_metrics.py -q
+python -m pytest --cloud tests/cloud/test_metrics.py -q
 TRACKIO_TEST_DATABASE_FILE=/absolute/private/local-test-url \
-  python -m pytest tests/cloud/test_postgres.py -q
+  python -m pytest --cloud tests/cloud/test_postgres.py -q
 ```
 
 The PostgreSQL URL must point to `127.0.0.1`, an explicit port and a database whose
