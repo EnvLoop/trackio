@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import math
+import re
 import stat
 import sys
 import time
@@ -26,6 +27,7 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.schema import CreateSchema
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -112,6 +114,7 @@ class CloudConfig:
     service_token: str = field(repr=False)
     signing_key: str = field(repr=False)
     token_ttl: int = 3600
+    database_schema: str | None = None
 
     def __post_init__(self):
         if self.environment not in ("local", "staging", "prod"):
@@ -128,6 +131,12 @@ class CloudConfig:
             raise ValueError("DISTINCT_STRONG_SERVICE_AND_SIGNING_KEYS_REQUIRED")
         if not 60 <= self.token_ttl <= 86400:
             raise ValueError("INVALID_TOKEN_TTL")
+        if self.database_schema is not None:
+            validate_schema(self.database_schema)
+            if not self.database_url.startswith("postgresql+psycopg://"):
+                raise ValueError("POSTGRESQL_SCHEMA_REQUIRED")
+        if self.environment != "local" and self.database_schema is None:
+            raise ValueError("EXPLICIT_POSTGRESQL_SCHEMA_REQUIRED")
 
     @classmethod
     def from_file(cls, path):
@@ -149,7 +158,19 @@ class CloudConfig:
             service_token=private_text(path.parent / raw["service_token_file"]),
             signing_key=private_text(path.parent / raw["signing_key_file"]),
             token_ttl=raw.get("token_ttl", 3600),
+            database_schema=raw.get("database_schema"),
         )
+
+
+def validate_schema(value):
+    if (
+        not isinstance(value, str)
+        or not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", value)
+        or value == "public"
+        or value.startswith("pg_")
+    ):
+        raise ValueError("PRIVATE_POSTGRESQL_SCHEMA_REQUIRED")
+    return value
 
 
 def issue_token(
@@ -196,7 +217,7 @@ class Conflict(ValueError):
 
 
 class MetricsRepository:
-    def __init__(self, url, *, initialize=True):
+    def __init__(self, url, *, initialize=True, schema=None):
         if not url.startswith(("sqlite:///", "postgresql+psycopg://")):
             raise ValueError("UNSUPPORTED_DATABASE")
         self.url = url
@@ -211,7 +232,11 @@ class MetricsRepository:
             if url.startswith("sqlite")
             else {},
         )
-        metadata = MetaData()
+        if schema is not None:
+            validate_schema(schema)
+            if not url.startswith("postgresql+psycopg://"):
+                raise ValueError("POSTGRESQL_SCHEMA_REQUIRED")
+        metadata = MetaData(schema=schema)
         self.schema = Table(
             "trackio_cloud_schema",
             metadata,
@@ -250,6 +275,9 @@ class MetricsRepository:
             Column("payload", Text, nullable=False),
         )
         if initialize:
+            if schema is not None:
+                with self.engine.begin() as connection:
+                    connection.execute(CreateSchema(schema, if_not_exists=True))
             metadata.create_all(self.engine)
         with self.engine.begin() as connection:
             versions = connection.execute(select(self.schema.c.version)).scalars().all()
@@ -429,7 +457,9 @@ class MetricsRepository:
 def create_app(config, repository=None):
     owns_repository = repository is None
     repository = repository or MetricsRepository(
-        config.database_url, initialize=config.environment == "local"
+        config.database_url,
+        initialize=config.environment == "local",
+        schema=config.database_schema,
     )
 
     def service(request):
@@ -597,7 +627,7 @@ def main():
     args = parser.parse_args()
     config = CloudConfig.from_file(args.config)
     if args.initialize:
-        MetricsRepository(config.database_url).close()
+        MetricsRepository(config.database_url, schema=config.database_schema).close()
         return
     uvicorn.run(
         create_app(config),

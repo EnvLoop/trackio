@@ -4,6 +4,11 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import pytest
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
+
 from trackio.cloud import Conflict, MetricsRepository
 
 
@@ -57,3 +62,62 @@ def test_real_postgres_restart_concurrency_and_transaction_rollback():
     assert reopened.events("w2", "p1", job_id) == []
     assert reopened.events("w1", "p1", job_id)[0]["step"] == 7
     reopened.close()
+
+
+def test_named_schema_does_not_touch_platform_tables_and_app_cannot_create_tables():
+    url = Path(os.environ["TRACKIO_TEST_DATABASE_FILE"]).read_text().strip()
+    address = urlsplit(url)
+    assert address.hostname == "127.0.0.1" and address.path.startswith("/trackio_test_")
+    name = "trackio_test_" + uuid4().hex[:12]
+    role = name + "_app"
+    password = uuid4().hex
+    repository = MetricsRepository(url, schema=name)
+    with repository.engine.begin() as connection:
+        connection.execute(
+            text(
+                f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE"
+            )
+        )
+        connection.execute(text(f'GRANT USAGE ON SCHEMA "{name}" TO "{role}"'))
+        connection.execute(
+            text(
+                f'GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA "{name}" TO "{role}"'
+            )
+        )
+    try:
+        tables = set(inspect(repository.engine).get_table_names(schema=name))
+        assert tables == {
+            "trackio_cloud_schema",
+            "trackio_cloud_runs",
+            "trackio_cloud_events",
+            "trackio_cloud_batches",
+            "trackio_cloud_configs",
+        }
+        repository.bind("w", "p", "job", "run", {})
+        repository.close()
+        reopened = MetricsRepository(url, schema=name, initialize=False)
+        assert reopened.events("w", "p", "job") == []
+        reopened.close()
+        app_url = (
+            make_url(url)
+            .set(username=role, password=password)
+            .render_as_string(hide_password=False)
+        )
+        app = MetricsRepository(app_url, schema=name, initialize=False)
+        app.bind("w", "p", "job2", "run2", {})
+        assert app.events("w", "p", "job2") == []
+        with pytest.raises(DBAPIError) as denied:
+            with app.engine.begin() as connection:
+                connection.execute(
+                    text(f'CREATE TABLE "{name}".forbidden (id integer)')
+                )
+        assert denied.value.orig.sqlstate == "42501"
+        app.close()
+        with pytest.raises(ValueError, match="PRIVATE_POSTGRESQL_SCHEMA"):
+            MetricsRepository(url, schema="public")
+    finally:
+        with repository.engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA "{name}" CASCADE'))
+            connection.execute(text(f'DROP OWNED BY "{role}"'))
+            connection.execute(text(f'DROP ROLE "{role}"'))
+        repository.close()
