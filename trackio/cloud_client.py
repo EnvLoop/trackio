@@ -78,6 +78,9 @@ class CloudRun:
         self.max_bytes = max_bytes
         self.directory = Path(spool_dir)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        metadata = self.directory.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise ValueError("PRIVATE_SPOOL_DIRECTORY_REQUIRED")
         self.transport = transport or httpx2.Client(
             timeout=10, follow_redirects=False, trust_env=False
         )
@@ -310,7 +313,8 @@ def init_from_context(path, *, config=None):
     context = json.loads(context_path.read_text())
     address = urlsplit(context["server_url"])
     if (
-        address.username
+        not address.hostname
+        or address.username
         or address.password
         or address.query
         or address.fragment
