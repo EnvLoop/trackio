@@ -96,6 +96,11 @@ must stop the metrics service and explicitly run `--migrate-from 1` using the
 migration identity and, where configured, `--owner-role`. Ordinary startup
 rejects mismatched versions without modifying tables. The application identity
 requires DML only; staging/prod also require an explicit private PostgreSQL schema.
+The v1 migration records a bounded 24-hour legacy-token grace in the database.
+Existing signed worker tokens retain their original expiry and scope, cannot
+refresh, and are checked against durable run revocation inside each write
+transaction. Fresh v2 installations have no legacy grace. Revoking a run also
+prevents a previously unused legacy token or a new Trial from reopening it.
 
 Automatic Job controller binding, recipe activation,
 object storage and SQLite import, quotas/retention, platform release/deployment

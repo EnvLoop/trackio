@@ -45,6 +45,7 @@ else:
 SCHEMA_VERSION = 2
 MAX_EVENTS = 256
 MAX_BODY = 1024 * 1024
+REVOKED_RUN_TRIAL = "__trackio_run_revoked__"
 
 
 def canonical(value):
@@ -299,6 +300,13 @@ class MetricsRepository:
             Column("revoked", Integer, nullable=False),
             UniqueConstraint("run_id", "trial_key"),
         )
+        self.migrations = Table(
+            "trackio_cloud_migrations",
+            metadata,
+            Column("version", Integer, primary_key=True),
+            Column("applied_at", Float, nullable=False),
+            Column("legacy_tokens_until", Float),
+        )
         try:
             with self.engine.begin() as connection:
                 if schema is not None and initialize:
@@ -321,6 +329,13 @@ class MetricsRepository:
                         raise ValueError("INCOMPATIBLE_MIGRATION_SOURCE")
                     metadata.create_all(connection)
                     connection.execute(
+                        self.migrations.insert().values(
+                            version=SCHEMA_VERSION,
+                            applied_at=time.time(),
+                            legacy_tokens_until=time.time() + 86400,
+                        )
+                    )
+                    connection.execute(
                         self.schema.update().values(version=SCHEMA_VERSION)
                     )
                 elif initialize:
@@ -331,6 +346,21 @@ class MetricsRepository:
                         connection.execute(
                             self.schema.insert().values(version=SCHEMA_VERSION)
                         )
+                    if (
+                        connection.execute(
+                            select(self.migrations.c.version).where(
+                                self.migrations.c.version == SCHEMA_VERSION
+                            )
+                        ).first()
+                        is None
+                    ):
+                        connection.execute(
+                            self.migrations.insert().values(
+                                version=SCHEMA_VERSION,
+                                applied_at=time.time(),
+                                legacy_tokens_until=None,
+                            )
+                        )
                 elif versions != [SCHEMA_VERSION]:
                     raise ValueError("SCHEMA_NOT_INITIALIZED_OR_INCOMPATIBLE")
                 if any(
@@ -338,6 +368,15 @@ class MetricsRepository:
                     for table in metadata.tables.values()
                 ):
                     raise ValueError("INCOMPLETE_SCHEMA")
+                if (
+                    connection.execute(
+                        select(self.migrations.c.version).where(
+                            self.migrations.c.version == SCHEMA_VERSION
+                        )
+                    ).first()
+                    is None
+                ):
+                    raise ValueError("INCOMPLETE_MIGRATION_RECEIPT")
         except BaseException:
             self.engine.dispose()
             raise
@@ -349,6 +388,8 @@ class MetricsRepository:
         now = time.time()
         if trial_id is not None:
             identifier(trial_id)
+            if trial_id == REVOKED_RUN_TRIAL:
+                raise ValueError("RESERVED_TRIAL_IDENTITY")
         if renew_until is not None and (
             not finite(renew_until) or not now < renew_until <= now + 604800
         ):
@@ -366,6 +407,16 @@ class MetricsRepository:
             )
             if matched.rowcount != 1:
                 raise PermissionError("RUN_SCOPE_MISMATCH")
+            if (
+                connection.execute(
+                    select(self.capabilities.c.capability_id).where(
+                        self.capabilities.c.run_id == identity["run_id"],
+                        self.capabilities.c.trial_key == REVOKED_RUN_TRIAL,
+                    )
+                ).first()
+                is not None
+            ):
+                raise PermissionError("CAPABILITY_REVOKED_OR_EXPIRED")
             row = (
                 connection.execute(
                     select(self.capabilities).where(
@@ -441,6 +492,24 @@ class MetricsRepository:
             )
             if matched.rowcount != 1:
                 raise PermissionError("RUN_SCOPE_MISMATCH")
+            if (
+                connection.execute(
+                    select(self.capabilities.c.capability_id).where(
+                        self.capabilities.c.run_id == identity["run_id"],
+                        self.capabilities.c.trial_key == REVOKED_RUN_TRIAL,
+                    )
+                ).first()
+                is None
+            ):
+                connection.execute(
+                    self.capabilities.insert().values(
+                        capability_id=secrets.token_hex(32),
+                        run_id=identity["run_id"],
+                        trial_key=REVOKED_RUN_TRIAL,
+                        renew_until=0,
+                        revoked=1,
+                    )
+                )
             connection.execute(
                 self.capabilities.update()
                 .where(self.capabilities.c.run_id == identity["run_id"])
@@ -493,8 +562,45 @@ class MetricsRepository:
         if row is None or row["revoked"] or row["renew_until"] <= time.time():
             raise PermissionError("CAPABILITY_REVOKED_OR_EXPIRED")
 
+    def _live_legacy(self, connection, claims):
+        now = time.time()
+        cutoff = connection.execute(
+            select(self.migrations.c.legacy_tokens_until).where(
+                self.migrations.c.version == SCHEMA_VERSION
+            )
+        ).scalar_one()
+        if cutoff is None or now >= cutoff or claims["expires_at"] <= now:
+            raise PermissionError("LEGACY_CAPABILITY_EXPIRED")
+        bound = connection.execute(
+            select(self.runs.c.run_id).where(
+                *[
+                    self.runs.c[key] == claims[key]
+                    for key in ("workspace_id", "project_id", "job_id", "run_id")
+                ]
+            )
+        ).first()
+        revoked = connection.execute(
+            select(self.capabilities.c.capability_id).where(
+                self.capabilities.c.run_id == claims["run_id"],
+                self.capabilities.c.revoked == 1,
+            )
+        ).first()
+        if bound is None or revoked is not None:
+            raise PermissionError("CAPABILITY_REVOKED_OR_EXPIRED")
+
+    def authorize_legacy(self, claims):
+        with self.engine.connect() as connection:
+            self._live_legacy(connection, claims)
+
     def append(
-        self, workspace_id, project_id, job_id, run_id, batch, capability_id=None
+        self,
+        workspace_id,
+        project_id,
+        job_id,
+        run_id,
+        batch,
+        capability_id=None,
+        legacy_claims=None,
     ):
         validate_batch(batch)
         digest = hashlib.sha256(canonical(batch).encode()).hexdigest()
@@ -513,6 +619,8 @@ class MetricsRepository:
                 raise PermissionError("RUN_SCOPE_MISMATCH")
             if capability_id is not None:
                 self._live_capability(connection, capability_id, run_id)
+            elif legacy_claims is not None:
+                self._live_legacy(connection, legacy_claims)
             previous = connection.execute(
                 select(self.batches.c.digest).where(
                     self.batches.c.run_id == run_id,
@@ -612,6 +720,8 @@ class MetricsRepository:
                 self._live_capability(
                     connection, claims["capability_id"], claims["run_id"]
                 )
+            else:
+                self._live_legacy(connection, claims)
             previous = connection.execute(
                 select(self.configs.c.payload).where(
                     self.configs.c.run_id == claims["run_id"]
@@ -715,7 +825,10 @@ def create_app(config, repository=None):
             config.signing_key,
             request.headers.get("authorization", "").removeprefix("Bearer "),
         )
-        capability = repository.authorize_capability(claims.get("capability_id"))
+        if claims.get("capability_id") is None:
+            repository.authorize_legacy(claims)
+            return claims
+        capability = repository.authorize_capability(claims["capability_id"])
         if any(
             claims.get(key) != capability.get(key)
             for key in ("run_id", "workspace_id", "project_id", "job_id", "trial_id")
@@ -754,7 +867,8 @@ def create_app(config, repository=None):
                 for key in ("workspace_id", "project_id", "job_id", "run_id")
             },
             batch=data,
-            capability_id=claims["capability_id"],
+            capability_id=claims.get("capability_id"),
+            legacy_claims=claims if claims.get("capability_id") is None else None,
         )
         return JSONResponse(
             {"batch_id": data["batch_id"], "accepted": accepted, "committed": True}

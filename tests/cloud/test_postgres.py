@@ -22,6 +22,7 @@ def test_explicit_postgres_migration_preserves_bound_run_and_durable_revocation(
     try:
         with repository.engine.begin() as connection:
             repository.capabilities.drop(connection)
+            repository.migrations.drop(connection)
             connection.execute(repository.schema.update().values(version=1))
         with pytest.raises(ValueError, match="SCHEMA_NOT_INITIALIZED_OR_INCOMPATIBLE"):
             MetricsRepository(url, schema=name, initialize=False)
@@ -131,6 +132,7 @@ def test_named_schema_does_not_touch_platform_tables_and_app_cannot_create_table
             "trackio_cloud_batches",
             "trackio_cloud_configs",
             "trackio_cloud_capabilities",
+            "trackio_cloud_migrations",
         }
         repository.bind("w", "p", "job", "run", {})
         repository.close()

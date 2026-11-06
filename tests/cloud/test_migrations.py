@@ -30,6 +30,7 @@ def test_explicit_v1_migration_preserves_events_and_startup_never_migrates(tmp_p
     )
     with original.engine.begin() as connection:
         original.capabilities.drop(connection)
+        original.migrations.drop(connection)
         connection.execute(original.schema.update().values(version=1))
     with pytest.raises(ValueError, match="SCHEMA_NOT_INITIALIZED_OR_INCOMPATIBLE"):
         MetricsRepository(url, initialize=False)
@@ -49,6 +50,7 @@ def test_unknown_version_rejects_before_any_additive_ddl(tmp_path):
     original = MetricsRepository(url)
     with original.engine.begin() as connection:
         original.capabilities.drop(connection)
+        original.migrations.drop(connection)
         connection.execute(original.schema.update().values(version=99))
     with pytest.raises(ValueError, match="INCOMPATIBLE_SCHEMA"):
         MetricsRepository(url)
