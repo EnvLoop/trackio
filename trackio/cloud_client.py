@@ -146,7 +146,10 @@ class CloudRun(RichCloudRun):
     def _write(self, path, payload):
         encoded = json.dumps(payload, allow_nan=False, separators=(",", ":"))
         previous_size = path.stat().st_size if path.exists() else 0
-        if self._spool_size() - previous_size + len(encoded.encode()) > self.max_bytes:
+        limit = self.max_bytes
+        if path.name not in {"state", "delivery-status"}:
+            limit -= min(512, self.max_bytes // 4)
+        if self._spool_size() - previous_size + len(encoded.encode()) > limit:
             raise BufferError("METRICS_SPOOL_FULL")
         temporary = path.with_suffix("." + uuid.uuid4().hex + ".tmp")
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -460,7 +463,7 @@ class ManagedCloudRun(CloudRun):
         )
         try:
             self._write(self.directory / "delivery-status", self.delivery_status)
-        except OSError:
+        except (OSError, BufferError):
             self._record_gap()
             self.delivery_status["committed"] = False
         if not self.delivery_status["committed"]:
