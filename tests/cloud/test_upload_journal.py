@@ -51,6 +51,11 @@ def test_revocation_after_physical_upload_leaves_collectable_scoped_intent(
         connection.execute(
             repository.workspace.uploads.update().values(created_at=time.time() - 90000)
         )
+        connection.execute(
+            repository.workspace.upload_locations.update().values(
+                created_at=time.time() - 90000
+            )
+        )
     assert repository.workspace.collect_orphans(scope, underlying)["removed"] == 1
     with pytest.raises(FileNotFoundError):
         underlying.get(key, digest, len(content))
@@ -83,6 +88,11 @@ def test_object_gc_preserves_committed_references_and_rejects_short_retention(
     with repository.engine.begin() as connection:
         connection.execute(
             repository.workspace.uploads.update().values(created_at=time.time() - 90000)
+        )
+        connection.execute(
+            repository.workspace.upload_locations.update().values(
+                created_at=time.time() - 90000
+            )
         )
     with pytest.raises(ValueError, match="INVALID_ORPHAN_RETENTION"):
         repository.workspace.collect_orphans(scope, objects, retention_seconds=0)

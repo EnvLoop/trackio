@@ -282,6 +282,7 @@ class WorkspaceRunMixin:
         return result
 
     def use_artifact(self, artifact_or_name, type=None):
+        expected_digest = None
         if isinstance(artifact_or_name, CloudArtifact):
             artifact = artifact_or_name.wait()
             name, version = artifact.name, artifact.version
@@ -297,13 +298,19 @@ class WorkspaceRunMixin:
                     version=version if separator else "latest",
                 )
                 source = linked["content"]["source"]
-                if source["scope"] != linked["scope"]:
+                if (
+                    linked.get("resolved_source_scope", source["scope"])
+                    != linked["scope"]
+                ):
                     raise PermissionError("CROSS_RUN_ARTIFACT_REQUIRES_EXPLICIT_SCOPES")
                 name, version, separator = source["name"], source["version"], ":"
+                expected_digest = source["digest"]
             version = version if separator else "latest"
         result = self._workspace_query(
             "resource", kind="artifact", name=name, version=version
         )
+        if expected_digest is not None and result["digest"] != expected_digest:
+            raise ValueError("REGISTRY_SOURCE_DIGEST_MISMATCH")
         if type is not None and result["content"]["artifact_type"] != type:
             raise ValueError("ARTIFACT_TYPE_MISMATCH")
         self._queue_workspace(

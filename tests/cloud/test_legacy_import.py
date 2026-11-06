@@ -141,12 +141,13 @@ def test_legacy_source_identity_is_workspace_scoped(tmp_path, workspace_database
     repository.close()
 
 
+@pytest.mark.parametrize("artifact_bytes", [b"actual-legacy-attachment", b""])
 def test_real_legacy_sqlite_media_artifact_readback_after_source_closed(
-    temp_dir, tmp_path, workspace_database
+    temp_dir, tmp_path, workspace_database, artifact_bytes
 ):
     module = importlib.import_module("trackio.cloud_import")
     weights = tmp_path / "weights.bin"
-    weights.write_bytes(b"actual-legacy-attachment")
+    weights.write_bytes(artifact_bytes)
     legacy = trackio.init(
         project="legacy-project",
         name="producer",
@@ -191,10 +192,7 @@ def test_real_legacy_sqlite_media_artifact_readback_after_source_closed(
     assert projected["version"] == artifact.version
     assert projected["content"]["legacy_manifest_digest"] == artifact.digest
     entry = projected["content"]["manifest"][0]
-    assert (
-        repository.read_object(scope, entry["_object"], objects)
-        == b"actual-legacy-attachment"
-    )
+    assert repository.read_object(scope, entry["_object"], objects) == artifact_bytes
     rich = repository.read_records(scope, "history")
     assert rich[0]["payload"]["values"]["image"]["chunks"][0]["_object"]
     assert len(repository.events("w", "p", "j")) == 1
@@ -204,8 +202,5 @@ def test_real_legacy_sqlite_media_artifact_readback_after_source_closed(
     assert (
         importer.receipt(scope, "real-legacy")["snapshot_digest"] == snapshot["digest"]
     )
-    assert (
-        repository.read_object(scope, entry["_object"], objects)
-        == b"actual-legacy-attachment"
-    )
+    assert repository.read_object(scope, entry["_object"], objects) == artifact_bytes
     repository.close()

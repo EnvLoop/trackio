@@ -69,6 +69,21 @@ def put(repository, scope, digest, payload, content_type, storage, *, claims=Non
                 },
             )
         )
+        connection.execute(
+            store._insert(store.upload_locations)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=[
+                    store.upload_locations.c.run_id,
+                    store.upload_locations.c.object_key,
+                ],
+                set_={
+                    name: value
+                    for name, value in values.items()
+                    if name not in ("run_id", "object_key")
+                },
+            )
+        )
     storage.put(key, payload, digest, content_type)
     with repository.engine.begin() as connection:
         guard(connection)
@@ -83,6 +98,18 @@ def put(repository, scope, digest, payload, content_type, storage, *, claims=Non
             .one()
         )
         if intent["generation"] != generation or intent["status"] != "pending":
+            raise RuntimeError("UPLOAD_LEASE_EXPIRED")
+        location = (
+            connection.execute(
+                select(store.upload_locations).where(
+                    store.upload_locations.c.run_id == scope["run_id"],
+                    store.upload_locations.c.object_key == key,
+                )
+            )
+            .mappings()
+            .one()
+        )
+        if location["generation"] != generation or location["status"] != "pending":
             raise RuntimeError("UPLOAD_LEASE_EXPIRED")
         storage.get(key, digest, len(payload))
         used = (
@@ -111,6 +138,15 @@ def put(repository, scope, digest, payload, content_type, storage, *, claims=Non
             .where(
                 store.uploads.c.run_id == scope["run_id"],
                 store.uploads.c.digest == digest,
+            )
+            .values(status="complete")
+        )
+        connection.execute(
+            store.upload_locations.update()
+            .where(
+                store.upload_locations.c.run_id == scope["run_id"],
+                store.upload_locations.c.object_key == key,
+                store.upload_locations.c.generation == generation,
             )
             .values(status="complete")
         )

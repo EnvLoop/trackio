@@ -10,7 +10,7 @@ a package or create a tag.
 
 ## Schema and explicit owner migration
 
-The final service uses **core schema 3 and workspace schema 1: 20 tables**.
+The final service uses **core schema 3 and workspace schema 2: 21 tables**.
 
 | Schema | Tables | Purpose |
 | --- | --- | --- |
@@ -19,6 +19,7 @@ The final service uses **core schema 3 and workspace schema 1: 20 tables**.
 | Workspace v1 | `trackio_workspace_schema`, `trackio_workspace_heads`, `trackio_workspace_resources`, `trackio_workspace_aliases` | Workspace stamp, monotonic versions, immutable artifacts/registry/logbook, aliases |
 | Workspace v1 | `trackio_workspace_operations`, `trackio_workspace_links`, `trackio_workspace_runs` | Content-bound operation receipts/audit, lineage, run name/retention/tombstone |
 | Workspace v1 | `trackio_workspace_imports`, `trackio_workspace_legacy_rows`, `trackio_workspace_legacy_files`, `trackio_workspace_uploads` | Offline import receipts/raw data/files, durable physical-upload intent and GC fence |
+| Workspace v2 addition | `trackio_workspace_upload_locations` | Per-run physical location/generation journal; preserves earlier project prefixes across retry and move |
 
 Use the backed-up database's private owner configuration, with the target schema
 explicitly selected. The existing schema owner must have DDL permissions and
@@ -37,7 +38,23 @@ PostgreSQL transaction**, under the schema advisory lock and selected owner role
 A workspace migration fault rolls back the core version, receipt and DDL too.
 It exits after migration and does not start a listener. `--initialize` is for a
 fresh schema, or adding workspace to an already compatible core v3; it rejects
-core v1 rather than silently migrating it. A preexisting core v2 uses
+core v1 rather than silently migrating it. For existing core v3/workspace v1,
+use the separate owner action:
+
+```sh
+python -m trackio.cloud --config /private/trackio-owner.toml \
+  --migrate-workspace-from 1 --owner-role trackio_owner
+```
+
+This requires a compatible existing core and workspace stamp exactly 1, upgrades
+only workspace to v2, seeds the location journal, and exits without a listener.
+The three CLI actions `--initialize`, `--migrate-from` and
+`--migrate-workspace-from` are mutually exclusive. `--migrate-from 3` stays invalid:
+core schema remains 3. The workspace upgrade and stamp update share one
+transaction; normal startup rejects workspace v1 without changing it. Repeating
+the exact-source workspace migration after success fails with
+`WORKSPACE_MIGRATION_SOURCE_MISMATCH` and leaves the new schema intact; use the
+normal no-DDL probe/startup to confirm success. A preexisting core v2 uses
 `--migrate-from 2`. The migrated v1 legacy-token compatibility window is 24 hours;
 normal new bindings use durable capabilities.
 
@@ -67,7 +84,9 @@ service location, and does not start an upstream dashboard or tunnel.
 The additional worker routes are exactly:
 
 1. `POST /v1/workspace/query`: own-run list/filter, compare, export, resources,
-   lineage, operation readback, and scoped legacy metadata readback.
+   lineage, operation readback, and scoped legacy metadata readback. Live
+   capability/legacy validation and all data reads share a run-locked transaction
+   after the bounded request body is read. Revocation serializes on that lock.
 2. `POST /v1/workspace/publish`: artifact/logbook/registry publication and own-run
    use/unlink/alias operations, all fenced again inside the run transaction.
 3. `GET /v1/workspace/objects/{64-lowercase-hex}`: catalog-authorized byte download.
@@ -143,7 +162,9 @@ external content does not trigger a network fetch.
 Use `read_rows`, `read_file`, `receipt`, or scoped administrative HTTP readback
 after closing/moving the original legacy source. Actual upstream SQLite/image/
 artifact/registry fixtures are tested with the original source moved offline,
-including repository close/reopen. The default snapshot budget is 512 MiB and
+including repository close/reopen and actual zero-byte native Artifact files.
+Empty files have a committed SHA-256 empty object and remain downloadable.
+The default snapshot budget is 512 MiB and
 10,000 files; object/run quotas still apply to import. This bounded operator API
 does not automatically discover arbitrary external upload paths or running
 writers: include all required legacy files in the explicit snapshot root.
@@ -155,13 +176,33 @@ event payloads and the full content identity metadata. Object bytes are
 downloaded separately with fresh authorization; exporting catalog metadata does
 not create permanent download authority. Compare preserves each run's original
 step/Trial/writer and supports time/metric/step filtering, with explicit limits.
+Time and step filters are applied before the result point budget. Tombstoned
+runs are also excluded from the original scalar metrics read endpoint.
+
+Registry source content and its digest retain historical provenance after a
+project move. Resolution separately supplies the current scope for the same
+stable workspace/Job/Run identity. Native use checks the current scope and exact
+source artifact digest; cross-run native use still needs explicit service scopes.
+Service lineage includes cross-run links; worker lineage only exposes links
+whose resolved target is its own current scope.
 
 Physical GC requires service authorization, the complete run scope and a minimum
-one-hour orphan retention (default one day). It deletes actual storage bytes
-before catalog cleanup, retains durable upload tombstones to catch late writes,
-and protects committed resource/record/import references. Bounded inventory
-pagination also covers pre-journal objects under the current scope prefix;
-durable intents retain prior scope prefixes across project moves. Local-file
+one-hour orphan retention (default one day). It commits catalog invalidation and
+a durable collecting claim before deleting any physical bytes. Each subsequent
+delete rechecks the physical location generation under the run lock. A partial
+delete or database failure cannot restore an ACKable catalog for missing bytes;
+collecting claims recover on retry/restart. A new upload generation prevents an
+older collector from deleting its replacement. Collected location tombstones
+remain available to catch late writes, and committed resource/record/import
+references protect their actual catalog location. Bounded inventory pagination
+also covers pre-journal objects under the current prefix and historical prefixes
+proven by committed same-identity project-move receipts. Cursors are opaque and
+must be passed back unchanged; foreign-prefix cursors are rejected. Each call
+processes at most 1,000 journal candidates and one bounded inventory page;
+operators repeat collection and follow `next` until inventory is exhausted.
+Move history is bounded to 1,000 receipts and reference/catalog scans to 10,000
+rows, with explicit failure when exceeded. Durable intents and location records
+retain prior scope prefixes across project moves. Local-file
 and S3-compatible inventory paths are implemented; no claim of live R2 testing
 is made by the synthetic/local tests.
 

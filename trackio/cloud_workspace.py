@@ -5,7 +5,8 @@ import importlib
 import json
 import re
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 
 from sqlalchemy import (
     Column,
@@ -15,11 +16,13 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    cast,
     func,
     inspect,
     select,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -29,7 +32,7 @@ from trackio.cloud_records import object_references
 from trackio.cloud_snapshot import relative_path
 
 SCOPE_FIELDS = ("workspace_id", "project_id", "job_id", "run_id")
-WORKSPACE_SCHEMA_VERSION = 1
+WORKSPACE_SCHEMA_VERSION = 2
 
 
 def scoped(value):
@@ -38,10 +41,17 @@ def scoped(value):
 
 class WorkspaceStore:
     def __init__(
-        self, repository, *, initialize=False, owner_role=None, connection=None
+        self,
+        repository,
+        *,
+        initialize=False,
+        owner_role=None,
+        connection=None,
+        migrate_from=None,
     ):
         self.repository = repository
         self.engine = repository.engine
+        self._connection = ContextVar("workspace_connection", default=None)
         metadata = MetaData(schema=repository.runs.schema)
         self.schema = Table(
             "trackio_workspace_schema",
@@ -137,6 +147,17 @@ class WorkspaceStore:
             Column("status", String(32), nullable=False),
             Column("created_at", Float, nullable=False),
         )
+        self.upload_locations = Table(
+            "trackio_workspace_upload_locations",
+            metadata,
+            Column("run_id", String(256), primary_key=True),
+            Column("object_key", String(129), primary_key=True),
+            Column("digest", String(64), nullable=False),
+            Column("scope", Text, nullable=False),
+            Column("generation", String(64), nullable=False),
+            Column("status", String(32), nullable=False),
+            Column("created_at", Float, nullable=False),
+        )
         with (
             self.engine.begin() if connection is None else nullcontext(connection)
         ) as connection:
@@ -162,18 +183,41 @@ class WorkspaceStore:
             exists = inspect(connection).has_table(
                 self.schema.name, schema=metadata.schema
             )
-            if exists:
-                if connection.execute(
+            if migrate_from is not None:
+                if not initialize or migrate_from not in range(
+                    1, WORKSPACE_SCHEMA_VERSION
+                ):
+                    raise ValueError("INVALID_WORKSPACE_MIGRATION_SOURCE")
+                if not exists or connection.execute(
                     select(self.schema.c.version)
-                ).scalars().all() != [WORKSPACE_SCHEMA_VERSION]:
+                ).scalars().all() != [migrate_from]:
+                    raise ValueError("WORKSPACE_MIGRATION_SOURCE_MISMATCH")
+            if exists:
+                versions = (
+                    connection.execute(select(self.schema.c.version)).scalars().all()
+                )
+                upgrading = versions == [1] and initialize
+                if versions != [WORKSPACE_SCHEMA_VERSION] and not upgrading:
                     raise ValueError("INCOMPATIBLE_WORKSPACE_SCHEMA")
                 if any(
                     not inspect(connection).has_table(
                         table.name, schema=metadata.schema
                     )
                     for table in metadata.tables.values()
+                    if not upgrading or table is not self.upload_locations
                 ):
                     raise ValueError("INCOMPLETE_WORKSPACE_SCHEMA")
+                if upgrading:
+                    self.upload_locations.create(connection)
+                    columns = [column.name for column in self.upload_locations.columns]
+                    connection.execute(
+                        self.upload_locations.insert().from_select(
+                            columns, select(*[self.uploads.c[name] for name in columns])
+                        )
+                    )
+                    connection.execute(
+                        self.schema.update().values(version=WORKSPACE_SCHEMA_VERSION)
+                    )
             elif initialize:
                 metadata.create_all(connection)
                 connection.execute(
@@ -188,6 +232,20 @@ class WorkspaceStore:
             if self.engine.dialect.name == "postgresql"
             else sqlite_insert(table)
         )
+
+    @contextmanager
+    def transaction(self, claims=None):
+        current = self._connection.get()
+        with (
+            self.engine.begin() if current is None else nullcontext(current)
+        ) as connection:
+            token = self._connection.set(connection)
+            try:
+                if claims is not None:
+                    self._guard(connection, claims)
+                yield connection
+            finally:
+                self._connection.reset(token)
 
     def _lock(self, connection, scope, *, allow_deleted=False):
         scope = scoped(scope)
@@ -460,7 +518,7 @@ class WorkspaceStore:
             "content": content,
             "aliases": aliases or [],
         }
-        with self.engine.begin() as connection:
+        with self.transaction() as connection:
             self._guard(connection, claims)
             if kind == "registry" and scoped(content["source"]["scope"]) != scope:
                 raise PermissionError("CROSS_RUN_LINK_REQUIRES_SERVICE_AUTH")
@@ -493,6 +551,25 @@ class WorkspaceStore:
             raise ValueError("RESOURCE_NOT_FOUND")
         result = json.loads(payload)
         result["scope"] = scoped(scope)
+        if kind == "registry":
+            source = result["content"]["source"]["scope"]
+            current = (
+                connection.execute(
+                    select(self.repository.runs).where(
+                        *[
+                            self.repository.runs.c[key] == source[key]
+                            for key in ("workspace_id", "job_id", "run_id")
+                        ]
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if current is not None and all(
+                source[key] == scope[key]
+                for key in ("workspace_id", "job_id", "run_id")
+            ):
+                result["resolved_source_scope"] = scoped(current)
         result["aliases"] = (
             connection.execute(
                 select(self.aliases.c.alias)
@@ -508,7 +585,7 @@ class WorkspaceStore:
         return result
 
     def resolve(self, scope, kind, name, version="latest"):
-        with self.engine.begin() as connection:
+        with self.transaction() as connection:
             self._lock(connection, scope)
             return self._resolve(connection, scope, kind, name, version)
 
@@ -528,7 +605,7 @@ class WorkspaceStore:
             kind=target_kind,
             target_name=target_name,
         )
-        with self.engine.begin() as connection:
+        with self.transaction() as connection:
             for scope in sorted((source, target), key=lambda scope: scope["run_id"]):
                 self._lock(connection, scope)
             previous = self._receipt(connection, target, operation_id, request)
@@ -568,8 +645,8 @@ class WorkspaceStore:
                 connection, target, operation_id, request, result
             )
 
-    def lineage(self, scope, name, version):
-        with self.engine.begin() as connection:
+    def lineage(self, scope, name, version, *, visible_scopes=None):
+        with self.transaction() as connection:
             self._lock(connection, scope)
             resource = self._resolve(connection, scope, "artifact", name, version)
             links = (
@@ -586,11 +663,28 @@ class WorkspaceStore:
             results = []
             for payload in links:
                 link = json.loads(payload)
+                target = link["target"]
+                current = (
+                    connection.execute(
+                        select(self.repository.runs).where(
+                            *[
+                                self.repository.runs.c[key] == target[key]
+                                for key in ("workspace_id", "job_id", "run_id")
+                            ]
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
+                if current is None or current["workspace_id"] != scope["workspace_id"]:
+                    continue
+                target = scoped(current)
                 if (
                     link["source"]["name"] == name
                     and link["source"]["digest"] == resource["digest"]
-                    and link["target"] == scoped(scope)
+                    and (visible_scopes is None or target in visible_scopes)
                 ):
+                    link["resolved_target_scope"] = target
                     results.append(link)
             return results
 
@@ -668,7 +762,7 @@ class WorkspaceStore:
         ):
             raise ValueError("INVALID_RUN_OPERATION")
         request = {"scope": scope, "action": action, "values": values}
-        with self.engine.begin() as connection:
+        with self.transaction() as connection:
             try:
                 state = self._lock(connection, scope, allow_deleted=True)
             except PermissionError:
@@ -744,7 +838,7 @@ class WorkspaceStore:
     def purge(self, scope):
         scope = scoped(scope)
         now = time.time()
-        with self.engine.begin() as connection:
+        with self.transaction() as connection:
             state = self._lock(connection, scope, allow_deleted=True)
             expired = state["expires_at"] is not None and state["expires_at"] <= now
             if not state["deleted"] and not expired:
@@ -778,139 +872,21 @@ class WorkspaceStore:
             return {"deleted": 1}
 
     def collect_objects(self, scope, storage):
-        with self.engine.begin() as connection:
-            state = self._lock(connection, scope, allow_deleted=True)
-            if not state["deleted"]:
-                raise ValueError("RUN_MUST_BE_DELETED")
-            objects = (
-                connection.execute(
-                    select(self.repository.objects).where(
-                        self.repository.objects.c.run_id == scope["run_id"]
-                    )
-                )
-                .mappings()
-                .all()
-            )
-            for row in objects:
-                storage.delete(row["object_key"])
-            connection.execute(
-                self.repository.objects.delete().where(
-                    self.repository.objects.c.run_id == scope["run_id"]
-                )
-            )
-            return {"removed": len(objects)}
+        collector = importlib.import_module("trackio.cloud_gc")
+        return collector.collect(self, scoped(scope), storage, deleted=True, limit=1000)
 
     def collect_orphans(
         self, scope, storage, *, retention_seconds=86400, limit=100, after=None
     ):
-        if (
-            type(retention_seconds) is not int
-            or retention_seconds < 3600
-            or type(limit) is not int
-            or not 1 <= limit <= 1000
-        ):
-            raise ValueError("INVALID_ORPHAN_RETENTION")
-        with self.engine.begin() as connection:
-            self._lock(connection, scope, allow_deleted=True)
-            referenced = set()
-            for table in (self.repository.documents, self.resources, self.legacy_files):
-                rows = (
-                    connection.execute(
-                        select(table.c.payload)
-                        .where(table.c.run_id == scope["run_id"])
-                        .limit(10001)
-                    )
-                    .scalars()
-                    .all()
-                )
-                if len(rows) > 10000:
-                    raise ValueError("OBJECT_REFERENCE_SCAN_LIMIT")
-                for payload in rows:
-                    referenced.update(object_references(json.loads(payload)))
-            candidates = (
-                connection.execute(
-                    select(self.uploads)
-                    .where(
-                        self.uploads.c.run_id == scope["run_id"],
-                        self.uploads.c.created_at <= time.time() - retention_seconds,
-                        self.uploads.c.digest.not_in(referenced),
-                    )
-                    .order_by(self.uploads.c.created_at, self.uploads.c.digest)
-                    .limit(limit)
-                )
-                .mappings()
-                .all()
-            )
-            removed = 0
-            for row in candidates:
-                if row["digest"] in referenced:
-                    continue
-                origin = json.loads(row["scope"])
-                if (
-                    any(
-                        origin[key] != scope[key]
-                        for key in ("workspace_id", "job_id", "run_id")
-                    )
-                    or row["object_key"] != content_digest(origin) + "/" + row["digest"]
-                ):
-                    raise PermissionError("OBJECT_GC_SCOPE_MISMATCH")
-                storage.delete(row["object_key"])
-                connection.execute(
-                    self.repository.objects.delete().where(
-                        self.repository.objects.c.run_id == scope["run_id"],
-                        self.repository.objects.c.digest == row["digest"],
-                        self.repository.objects.c.object_key == row["object_key"],
-                    )
-                )
-                connection.execute(
-                    self.uploads.update()
-                    .where(
-                        self.uploads.c.run_id == scope["run_id"],
-                        self.uploads.c.digest == row["digest"],
-                    )
-                    .values(status="collected", created_at=time.time())
-                )
-                removed += 1
-            inventory = {"objects": [], "next": None}
-            if hasattr(storage, "inventory"):
-                inventory = storage.inventory(
-                    content_digest(scoped(scope)), after=after, limit=limit
-                )
-                for entry in inventory["objects"]:
-                    digest = entry["key"].rsplit("/", 1)[-1]
-                    if (
-                        digest in referenced
-                        or entry["modified_at"] > time.time() - retention_seconds
-                    ):
-                        continue
-                    intent = connection.execute(
-                        select(self.uploads.c.created_at).where(
-                            self.uploads.c.run_id == scope["run_id"],
-                            self.uploads.c.digest == digest,
-                        )
-                    ).scalar_one_or_none()
-                    if intent is not None and intent > time.time() - retention_seconds:
-                        continue
-                    if entry["key"] != content_digest(
-                        scoped(scope)
-                    ) + "/" + digest or not re.fullmatch(r"[a-f0-9]{64}", digest):
-                        raise PermissionError("OBJECT_GC_SCOPE_MISMATCH")
-                    storage.delete(entry["key"])
-                    connection.execute(
-                        self.repository.objects.delete().where(
-                            self.repository.objects.c.run_id == scope["run_id"],
-                            self.repository.objects.c.digest == digest,
-                            self.repository.objects.c.object_key == entry["key"],
-                        )
-                    )
-                    removed += 1
-            return {
-                "removed": removed,
-                "scanned": len(candidates),
-                "retention_seconds": retention_seconds,
-                "inventory_scanned": len(inventory["objects"]),
-                "next": inventory["next"],
-            }
+        collector = importlib.import_module("trackio.cloud_gc")
+        return collector.collect(
+            self,
+            scoped(scope),
+            storage,
+            retention_seconds=retention_seconds,
+            limit=limit,
+            after=after,
+        )
 
     def export(self, scope, *, max_records=10000, max_bytes=16 * 1024 * 1024):
         scope = scoped(scope)
@@ -921,7 +897,7 @@ class WorkspaceStore:
             or not 1 <= max_bytes <= 64 * 1024 * 1024
         ):
             raise ValueError("INVALID_EXPORT_LIMIT")
-        with self.engine.begin() as connection:
+        with self.transaction() as connection:
             state = self._lock(connection, scope)
             config = connection.execute(
                 select(self.repository.runs.c.config).where(
@@ -1005,7 +981,7 @@ class WorkspaceStore:
         scopes = [scoped(scope) for scope in scopes]
         if len({scope["workspace_id"] for scope in scopes}) != 1:
             raise PermissionError("CROSS_WORKSPACE_COMPARE_DENIED")
-        with self.engine.begin() as connection:
+        with self.transaction() as connection:
             for scope in sorted(scopes, key=lambda value: value["run_id"]):
                 self._lock(connection, scope)
             results = []
@@ -1016,6 +992,18 @@ class WorkspaceStore:
                     conditions.append(self.repository.records.c.observed_at >= start)
                 if end is not None:
                     conditions.append(self.repository.records.c.observed_at <= end)
+                if self.engine.dialect.name == "postgresql":
+                    step = cast(self.repository.records.c.payload, JSONB)[
+                        "step"
+                    ].as_integer()
+                else:
+                    step = func.json_extract(
+                        self.repository.records.c.payload, "$.step"
+                    )
+                if min_step is not None:
+                    conditions.append(step >= min_step)
+                if max_step is not None:
+                    conditions.append(step <= max_step)
                 entries = (
                     connection.execute(
                         select(self.repository.records.c.payload)
@@ -1065,15 +1053,28 @@ class WorkspaceStore:
 
 
 class WorkspaceRepository(MetricsRepository):
-    def __init__(self, *args, initialize_workspace=False, **kwargs):
+    def __init__(
+        self, *args, initialize_workspace=False, migrate_workspace_from=None, **kwargs
+    ):
+        if migrate_workspace_from is not None and (
+            kwargs.get("initialize", True) or kwargs.get("migrate_from") is not None
+        ):
+            raise ValueError("WORKSPACE_MIGRATION_REQUIRES_EXISTING_CORE")
+
         def extension(repository, connection):
             self.workspace = WorkspaceStore(
                 repository,
                 initialize=initialize_workspace,
                 connection=connection,
+                migrate_from=migrate_workspace_from,
             )
 
-        super().__init__(*args, _schema_extension=extension, **kwargs)
+        super().__init__(
+            *args,
+            _schema_extension=extension,
+            _schema_extension_ddl=migrate_workspace_from is not None,
+            **kwargs,
+        )
 
     def _workspace_fence(self, connection, run_id):
         deleted = connection.execute(

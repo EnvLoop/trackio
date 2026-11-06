@@ -10,6 +10,7 @@ from sqlalchemy import event, inspect, select, text
 from sqlalchemy.engine import make_url
 
 from trackio.cloud import MetricsRepository
+from trackio.cloud_objects import FileObjects
 from trackio.cloud_workspace import WorkspaceRepository
 
 
@@ -28,6 +29,90 @@ def old_database(url, schema):
     return repository
 
 
+def test_workspace_v1_requires_explicit_upgrade_and_preserves_upload_journal(
+    workspace_database, tmp_path
+):
+    url, schema = workspace_database
+    repository = WorkspaceRepository(url, schema=schema, initialize_workspace=True)
+    scope = dict(workspace_id="w", project_id="p", job_id="j", run_id="r")
+    repository.bind(**scope, config={})
+    repository.put_import_object(scope, b"migration", FileObjects(tmp_path / "objects"))
+    assert hasattr(repository.workspace, "upload_locations")
+    with repository.engine.begin() as connection:
+        repository.workspace.upload_locations.drop(connection)
+        connection.execute(repository.workspace.schema.update().values(version=1))
+    with pytest.raises(ValueError, match="INCOMPATIBLE_WORKSPACE_SCHEMA"):
+        WorkspaceRepository(url, schema=schema, initialize=False)
+    upgraded = WorkspaceRepository(
+        url, schema=schema, initialize=False, initialize_workspace=True
+    )
+    with upgraded.engine.connect() as connection:
+        assert (
+            connection.execute(select(upgraded.workspace.schema.c.version)).scalar_one()
+            == 2
+        )
+        assert (
+            connection.execute(
+                select(upgraded.workspace.upload_locations.c.status)
+            ).scalar_one()
+            == "complete"
+        )
+    upgraded.close()
+    repository.close()
+
+
+def test_real_cli_explicit_workspace_v1_upgrade_exits_without_listener(
+    workspace_database, tmp_path
+):
+    url, schema = workspace_database
+    repository = WorkspaceRepository(url, schema=schema, initialize_workspace=True)
+    repository.bind("w", "p", "j", "r", {})
+    with repository.engine.begin() as connection:
+        repository.workspace.upload_locations.drop(connection)
+        connection.execute(repository.workspace.schema.update().values(version=1))
+    config = tmp_path / "workspace-owner.toml"
+    (tmp_path / "service").write_text("s" * 32)
+    (tmp_path / "signing").write_text("k" * 32)
+    config.write_text(
+        f'environment="local"\ndatabase_url="{url}"\nservice_token_file="service"\nsigning_key_file="signing"\n'
+        + (f'database_schema="{schema}"\n' if schema else "")
+    )
+    for path in (config, tmp_path / "service", tmp_path / "signing"):
+        path.chmod(0o600)
+    arguments = [
+        sys.executable,
+        "-m",
+        "trackio.cloud",
+        "--config",
+        str(config),
+        "--migrate-workspace-from",
+        "1",
+    ]
+    result = subprocess.run(arguments, capture_output=True, timeout=20)
+    assert result.returncode == 0, result.stderr.decode()
+    with repository.engine.connect() as connection:
+        assert connection.execute(select(repository.schema.c.version)).scalar_one() == 3
+        assert (
+            connection.execute(
+                select(repository.workspace.schema.c.version)
+            ).scalar_one()
+            == 2
+        )
+    reopened = WorkspaceRepository(url, schema=schema, initialize=False)
+    assert (
+        reopened.workspace.list_runs(
+            dict(workspace_id="w", project_id="p", job_id="j")
+        )["runs"][0]["run_id"]
+        == "r"
+    )
+    reopened.close()
+    again = subprocess.run(arguments, capture_output=True, timeout=20)
+    assert (
+        again.returncode != 0 and b"WORKSPACE_MIGRATION_SOURCE_MISMATCH" in again.stderr
+    )
+    repository.close()
+
+
 def test_owner_upgrade_builds_core_and_workspace_once_without_startup_ddl(
     workspace_database, monkeypatch
 ):
@@ -41,7 +126,7 @@ def test_owner_upgrade_builds_core_and_workspace_once_without_startup_ddl(
         url, schema=schema, initialize=False, migrate_from=1, initialize_workspace=True
     )
     tables = set(inspect(upgraded.engine).get_table_names(schema=schema))
-    assert len(tables) == 20
+    assert len(tables) == 21
     upgraded.close()
     statements = []
     module = importlib.import_module("trackio.cloud")
@@ -172,7 +257,34 @@ def test_real_owner_cli_migrates_workspace_for_restricted_staging_app(
                 .scalars()
                 .all()
             )
-            assert len(ownership) == 20 and set(ownership) == {owner}
+            assert len(ownership) == 21 and set(ownership) == {owner}
+            connection.execute(text(f'SET LOCAL ROLE "{owner}"'))
+            connection.connection.driver_connection.execute(
+                sql.SQL("DROP TABLE {}.trackio_workspace_upload_locations").format(
+                    sql.Identifier(schema)
+                )
+            )
+            connection.connection.driver_connection.execute(
+                sql.SQL("UPDATE {}.trackio_workspace_schema SET version=1").format(
+                    sql.Identifier(schema)
+                )
+            )
+        workspace_upgrade = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "trackio.cloud",
+                "--config",
+                str(config),
+                "--migrate-workspace-from",
+                "1",
+                "--owner-role",
+                owner,
+            ],
+            capture_output=True,
+            timeout=20,
+        )
+        assert workspace_upgrade.returncode == 0, workspace_upgrade.stderr.decode()
         app_url = (
             make_url(url)
             .set(username=app, password=password)
@@ -187,6 +299,11 @@ def test_real_owner_cli_migrates_workspace_for_restricted_staging_app(
                 "trial_id": None,
                 "capability_id": capability["capability_id"],
             }
+            objects = FileObjects(tmp_path / "restricted-objects")
+            digest = restricted.put_import_object(scope, b"restricted-upload", objects)
+            assert (
+                restricted.read_object(scope, digest, objects) == b"restricted-upload"
+            )
             assert (
                 restricted.workspace.publish(
                     claims,

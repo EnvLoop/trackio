@@ -254,7 +254,12 @@ class MetricsRepository(RichRepository):
         migrate_from=None,
         owner_role=None,
         _schema_extension=None,
+        _schema_extension_ddl=False,
     ):
+        if _schema_extension_ddl and (
+            _schema_extension is None or initialize or migrate_from is not None
+        ):
+            raise ValueError("INVALID_SCHEMA_EXTENSION_DDL")
         if not url.startswith(("sqlite:///", "postgresql+psycopg://")):
             raise ValueError("UNSUPPORTED_DATABASE")
         self.url = url
@@ -332,7 +337,7 @@ class MetricsRepository(RichRepository):
         try:
             with self.engine.begin() as connection:
                 if url.startswith("postgresql+psycopg://") and (
-                    initialize or migrate_from
+                    initialize or migrate_from or _schema_extension_ddl
                 ):
                     lock_id = int.from_bytes(
                         hashlib.sha256((schema or "public").encode()).digest()[:8],
@@ -348,7 +353,7 @@ class MetricsRepository(RichRepository):
                 if owner_role is not None:
                     validate_schema(owner_role)
                     if not url.startswith("postgresql+psycopg://") or not (
-                        initialize or migrate_from
+                        initialize or migrate_from or _schema_extension_ddl
                     ):
                         raise ValueError("EXPLICIT_POSTGRESQL_DDL_REQUIRED")
                     connection.execute(text(f'SET LOCAL ROLE "{owner_role}"'))
@@ -732,6 +737,15 @@ class MetricsRepository(RichRepository):
             statement = statement.where(self.records.c.observed_at <= end)
         if trial_id is not None:
             statement = statement.where(self.records.c.trial_id == trial_id)
+        if hasattr(self, "workspace"):
+            statement = statement.where(
+                ~select(self.workspace.state.c.run_id)
+                .where(
+                    self.workspace.state.c.run_id == self.records.c.run_id,
+                    self.workspace.state.c.deleted == 1,
+                )
+                .exists()
+            )
         statement = statement.order_by(
             self.records.c.observed_at, self.records.c.event_id
         ).limit(limit)
@@ -1138,16 +1152,30 @@ def main():
     schema_action.add_argument(
         "--migrate-from", choices=range(1, SCHEMA_VERSION), type=int
     )
+    schema_action.add_argument(
+        "--migrate-workspace-from",
+        choices=range(
+            1,
+            importlib.import_module("trackio.cloud_workspace").WORKSPACE_SCHEMA_VERSION,
+        ),
+        type=int,
+        help="Explicitly upgrade an existing workspace schema on compatible core, then exit",
+    )
     parser.add_argument("--owner-role")
     args = parser.parse_args()
     config = CloudConfig.from_file(args.config)
-    if args.initialize or args.migrate_from is not None:
+    if (
+        args.initialize
+        or args.migrate_from is not None
+        or args.migrate_workspace_from is not None
+    ):
         importlib.import_module("trackio.cloud_workspace").WorkspaceRepository(
             config.database_url,
             schema=config.database_schema,
             initialize=args.initialize,
             initialize_workspace=True,
             migrate_from=args.migrate_from,
+            migrate_workspace_from=args.migrate_workspace_from,
             owner_role=args.owner_role,
         ).close()
         return

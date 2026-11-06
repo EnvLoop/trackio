@@ -86,6 +86,8 @@ class LegacyImporter:
         with (Path(snapshot) / "files" / name).open("rb") as stream:
             while content := stream.read(MAX_OBJECT_BYTES):
                 chunks.append(self._object(connection, scope, content))
+            if not chunks:
+                chunks.append(self._object(connection, scope, b""))
         manifest = {"digest": info["digest"], "size": info["size"], "chunks": chunks}
         connection.execute(
             self.store.legacy_files.insert().values(
@@ -596,6 +598,8 @@ class LegacyImporter:
         for name in manifest["files"]:
             scope = scoped(bindings["files"][name])
             with (Path(snapshot) / "files" / name).open("rb") as stream:
+                if manifest["files"][name]["size"] == 0:
+                    self.repository.put_import_object(scope, b"", self.objects)
                 while content := stream.read(MAX_OBJECT_BYTES):
                     self.repository.put_import_object(scope, content, self.objects)
         with self.repository.engine.begin() as connection:
@@ -744,7 +748,7 @@ class LegacyImporter:
         source_id = content_digest(
             {"workspace_id": scope["workspace_id"], "source_id": source_id}
         )
-        with self.repository.engine.begin() as connection:
+        with self.store.transaction() as connection:
             self.store._lock(connection, scope)
             payload = connection.execute(
                 select(self.store.legacy_files.c.payload).where(
@@ -785,7 +789,7 @@ class LegacyImporter:
         )
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("INVALID_QUERY_LIMIT")
-        with self.repository.engine.begin() as connection:
+        with self.store.transaction() as connection:
             self.store._lock(connection, scope)
             rows = self.store.legacy_rows
             conditions = [
@@ -810,7 +814,7 @@ class LegacyImporter:
         source_id = content_digest(
             {"workspace_id": scope["workspace_id"], "source_id": source_id}
         )
-        with self.repository.engine.begin() as connection:
+        with self.store.transaction() as connection:
             self.store._lock(connection, scope)
             payload = connection.execute(
                 select(self.store.imports.c.payload).where(

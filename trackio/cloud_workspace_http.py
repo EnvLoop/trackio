@@ -58,6 +58,10 @@ def install_routes(app, config, repository, objects):
     async def query(request):
         claims = authorization(request)
         data = await read_body(request)
+        with store.transaction(claims):
+            return query_data(data, claims)
+
+    def query_data(data, claims):
         action = data["action"]
         if action == "list":
             result = store.list_runs(
@@ -126,11 +130,12 @@ def install_routes(app, config, repository, objects):
                     effective_scope(data, claims),
                     data["name"],
                     data.get("version", "latest"),
+                    visible_scopes=[scoped(claims)] if claims else None,
                 )
             }
         elif action == "operation":
             scope = effective_scope(data, claims)
-            with store.engine.begin() as connection:
+            with store.transaction() as connection:
                 store._lock(connection, scope)
                 row = (
                     connection.execute(

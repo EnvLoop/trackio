@@ -17,7 +17,7 @@ def resources(store, scope, *, kind, prefix="", limit=1000):
         or not 1 <= limit <= 1000
     ):
         raise ValueError("INVALID_RESOURCE_QUERY")
-    with store.engine.begin() as connection:
+    with store.transaction() as connection:
         store._lock(connection, scope)
         rows = (
             connection.execute(
@@ -63,7 +63,7 @@ def resources(store, scope, *, kind, prefix="", limit=1000):
 def change(store, scope, data, *, claims=None):
     action, operation_id = data["action"], data["operation_id"]
     request = {"scope": scope, **data}
-    with store.engine.begin() as connection:
+    with store.transaction() as connection:
         if claims is None:
             store._lock(connection, scope)
         else:
