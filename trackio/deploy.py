@@ -27,6 +27,7 @@ from trackio.bucket_storage import (
     upload_project_to_bucket_for_static,
 )
 from trackio.cas import PARTIAL_BLOB_GLOB
+from trackio.cloud_mode import flush_managed, is_managed
 from trackio.frontend_config import resolve_frontend_dir
 from trackio.pending_uploads import replay_pending_uploads
 from trackio.remote_client import RemoteClient, handle_file
@@ -1118,6 +1119,9 @@ def sync(
     Returns:
         `str`: The Space ID of the synced project.
     """
+    if is_managed():
+        flush_managed()
+        return None
     if sdk not in ("gradio", "static"):
         raise ValueError(f"sdk must be 'gradio' or 'static', got '{sdk}'")
     if sdk == "static" and private is True:
@@ -1259,6 +1263,9 @@ def freeze(
     Returns:
         `str`: The Space ID of the newly created static Space.
     """
+    if is_managed():
+        flush_managed()
+        return None
     if private is True:
         raise ValueError(
             "private=True is not supported for frozen static Trackio Spaces. Static "

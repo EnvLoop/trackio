@@ -2517,7 +2517,7 @@ requires-dist = [
     { name = "brotli", specifier = ">=1.2.1,<2.0.0" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.28,<1" },
     { name = "httpx2", specifier = ">=2.0.0,<3" },
-    { name = "huggingface-hub", specifier = ">=1.31.0,<2" },
+    { name = "huggingface-hub", specifier = ">=1.31.0,<3" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.30.0,<3.0.0" },
     { name = "numpy", specifier = "<3.0.0" },
     { name = "nvidia-ml-py", marker = "extra == 'gpu'", specifier = ">=12.0.0" },
