@@ -10,9 +10,9 @@ from sqlalchemy.engine import make_url
 from trackio.cloud import (
     SCHEMA_VERSION,
     CloudConfig,
-    MetricsRepository,
     configured_objects,
 )
+from trackio.cloud_workspace import WORKSPACE_SCHEMA_VERSION, WorkspaceRepository
 
 
 def check(filename, *, require_objects=False):
@@ -20,9 +20,10 @@ def check(filename, *, require_objects=False):
     if configuration.database_url.startswith("sqlite:///"):
         if not Path(make_url(configuration.database_url).database).is_file():
             raise ValueError("DATABASE_NOT_INITIALIZED")
-    repository = MetricsRepository(
+    repository = WorkspaceRepository(
         configuration.database_url,
         initialize=False,
+        initialize_workspace=False,
         schema=configuration.database_schema,
     )
     try:
@@ -33,6 +34,7 @@ def check(filename, *, require_objects=False):
             status="ready",
             api_version=1,
             schema_version=SCHEMA_VERSION,
+            workspace_schema_version=WORKSPACE_SCHEMA_VERSION,
             objects_configured=objects is not None,
         )
     finally:
