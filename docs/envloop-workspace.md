@@ -196,8 +196,15 @@ older collector from deleting its replacement. Collected location tombstones
 remain available to catch late writes, and committed resource/record/import
 references protect their actual catalog location. Bounded inventory pagination
 also covers pre-journal objects under the current prefix and historical prefixes
-proven by committed same-identity project-move receipts. Cursors are opaque and
-must be passed back unchanged; foreign-prefix cursors are rejected. Each call
+proven by committed same-identity project-move receipts. Purge retains these
+receipts as physical-cleanup audit evidence, including after workspace-v1
+migration. Before retaining or using a move receipt, the service
+verifies its request digest and complete scope, including stable workspace,
+Job and Run identity. Other business operation receipts are purged normally.
+Retained cleanup evidence survives repeated purge and repository restart;
+purging business data does not revoke the service's historical cleanup authority.
+Cursors are opaque and must be passed back unchanged; foreign-prefix cursors are
+rejected. Each call
 processes at most 1,000 journal candidates and one bounded inventory page;
 operators repeat collection and follow `next` until inventory is exhausted.
 Move history is bounded to 1,000 receipts and reference/catalog scans to 10,000

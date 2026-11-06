@@ -843,6 +843,8 @@ class WorkspaceStore:
             expired = state["expires_at"] is not None and state["expires_at"] <= now
             if not state["deleted"] and not expired:
                 return {"deleted": 0}
+            collector = importlib.import_module("trackio.cloud_gc")
+            _, cleanup_receipts = collector.cleanup_history(self, connection, scope)
             connection.execute(
                 self.state.update()
                 .where(self.state.c.run_id == scope["run_id"])
@@ -866,9 +868,12 @@ class WorkspaceStore:
                 self.legacy_files,
                 self.operations,
             ):
-                connection.execute(
-                    table.delete().where(table.c.run_id == scope["run_id"])
-                )
+                statement = table.delete().where(table.c.run_id == scope["run_id"])
+                if table is self.operations and cleanup_receipts:
+                    statement = statement.where(
+                        table.c.operation_id.not_in(cleanup_receipts)
+                    )
+                connection.execute(statement)
             return {"deleted": 1}
 
     def collect_objects(self, scope, storage):

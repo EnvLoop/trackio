@@ -8,7 +8,7 @@ import uuid
 from sqlalchemy import cast, func, select
 from sqlalchemy.dialects.postgresql import JSONB
 
-from trackio.cloud_protocol import content_digest
+from trackio.cloud_protocol import SCOPE_FIELDS, content_digest
 from trackio.cloud_records import object_references
 
 
@@ -22,7 +22,7 @@ def validate_location(scope, row):
         raise PermissionError("OBJECT_GC_SCOPE_MISMATCH")
 
 
-def inventory_page(store, connection, scope, storage, after, limit):
+def cleanup_history(store, connection, scope):
     origins = {content_digest(scope): scope}
     if store.engine.dialect.name == "postgresql":
         action = cast(store.operations.c.payload, JSONB)["request"][
@@ -32,24 +32,39 @@ def inventory_page(store, connection, scope, storage, after, limit):
         action = func.json_extract(store.operations.c.payload, "$.request.action")
     moves = (
         connection.execute(
-            select(store.operations.c.payload)
+            select(store.operations)
             .where(store.operations.c.run_id == scope["run_id"], action == "move")
             .limit(1001)
         )
-        .scalars()
+        .mappings()
         .all()
     )
     if len(moves) > 1000:
         raise ValueError("OBJECT_SCOPE_HISTORY_LIMIT")
-    for payload in moves:
-        request = json.loads(payload)["request"]
+    operation_ids = []
+    for row in moves:
+        request = json.loads(row["payload"])["request"]
+        if (
+            row["digest"] != content_digest(request)
+            or set(request) != {"scope", "action", "values"}
+            or set(request["values"]) != {"destination"}
+        ):
+            raise PermissionError("OBJECT_GC_SCOPE_MISMATCH")
         for origin in (request["scope"], request["values"]["destination"]):
-            if any(
+            if set(origin) != set(SCOPE_FIELDS) or any(
                 origin[key] != scope[key]
                 for key in ("workspace_id", "job_id", "run_id")
             ):
                 raise PermissionError("OBJECT_GC_SCOPE_MISMATCH")
+            for value in origin.values():
+                store.repository.validate_identity(value)
             origins[content_digest(origin)] = origin
+        operation_ids.append(row["operation_id"])
+    return origins, operation_ids
+
+
+def inventory_page(store, connection, scope, storage, after, limit):
+    origins, _ = cleanup_history(store, connection, scope)
     prefixes = sorted(origins)
     prefix, cursor = prefixes[0], None
     if after is not None:
