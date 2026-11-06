@@ -864,14 +864,19 @@ def create_app(config, repository=None, *, objects=None):
     async def ready(request):
         with repository.engine.connect() as connection:
             connection.execute(select(repository.schema.c.version)).one()
+            workspace_version = (
+                connection.execute(
+                    select(repository.workspace.schema.c.version)
+                ).scalar_one()
+                if hasattr(repository, "workspace")
+                else None
+            )
         return JSONResponse(
             {
                 "status": "ready",
                 "schema_version": SCHEMA_VERSION,
                 "api_version": 1,
-                "workspace_schema_version": 1
-                if hasattr(repository, "workspace")
-                else None,
+                "workspace_schema_version": workspace_version,
                 "capabilities": ["runs", "scalar_metrics", "system_metrics", "records"]
                 + (["objects"] if objects is not None else []),
             }
