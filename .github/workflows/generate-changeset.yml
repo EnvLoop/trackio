@@ -20,7 +20,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.repository == 'gradio-app/trackio' && github.event.workflow_run.conclusion == 'success'
     outputs:
       found_pr: ${{ steps.pr_details.outputs.found_pr }}
       pr_number: ${{ steps.pr_details.outputs.pr_number }}

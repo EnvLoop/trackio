@@ -10,7 +10,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [hf-jobs-cpu-upgrade, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -59,25 +59,57 @@ jobs:
         uv pip install --system pytest --prerelease=allow --python "${{ steps.setup-python.outputs.python-path }}"
 
     - name: Build frontend
-      if: matrix.os == 'hf-jobs-cpu-upgrade'
+      if: matrix.os == 'ubuntu-latest'
       run: |
         cd trackio/frontend
         npm ci
         npm run build
 
     - name: Run frontend unit tests
-      if: matrix.os == 'hf-jobs-cpu-upgrade'
+      if: matrix.os == 'ubuntu-latest'
       run: |
         cd trackio/frontend
         npm test
 
     - name: Run backend unit tests
       run: |
-        "${{ steps.setup-python.outputs.python-path }}" -m pytest --deselect=tests/ui --deselect=tests/e2e-spaces --deselect=tests/unit/test_gpu_hardware.py
+        "${{ steps.setup-python.outputs.python-path }}" -m pytest --ignore=tests/cloud --deselect=tests/ui --deselect=tests/e2e-spaces --deselect=tests/unit/test_gpu_hardware.py
 
     - name: Run ui/ux interaction tests
-      if: matrix.os == 'hf-jobs-cpu-upgrade'
-      env:
-        PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      if: matrix.os == 'ubuntu-latest'
       run: |
+        "${{ steps.setup-python.outputs.python-path }}" -m playwright install --with-deps chromium
         "${{ steps.setup-python.outputs.python-path }}" -m pytest tests/ui
+
+  cloud:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: synthetic-ci-password
+          POSTGRES_DB: trackio_test_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.19'
+      - name: Install locked cloud test dependencies
+        run: uv sync --locked --extra dev --extra cloud --extra spaces
+      - name: Run SQLite and real PostgreSQL cloud contracts
+        env:
+          TRACKIO_TEST_DATABASE_FILE: ${{ runner.temp }}/trackio-test-database-url
+        run: |
+          umask 077
+          printf '%s' 'postgresql+psycopg://postgres:synthetic-ci-password@127.0.0.1:5432/trackio_test_ci' > "$TRACKIO_TEST_DATABASE_FILE"
+          uv run --no-sync pytest tests/cloud -q

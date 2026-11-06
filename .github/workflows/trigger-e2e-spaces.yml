@@ -9,6 +9,7 @@ permissions: {}
 
 jobs:
   trigger:
+    if: github.repository == 'gradio-app/trackio'
     name: "trigger-e2e-spaces"
     runs-on: ubuntu-latest
     permissions:

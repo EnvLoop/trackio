@@ -1,0 +1,11 @@
+**
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!hatch_build.py
+!trackio/
+!trackio/**
+trackio/**/__pycache__
+trackio/frontend/node_modules
+trackio/frontend/dist
