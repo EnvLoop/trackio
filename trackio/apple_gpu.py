@@ -155,10 +155,10 @@ class AppleGpuMonitor:
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._thread.start()
 
-    def stop(self):
+    def stop(self, timeout=2.0):
         self._stop_flag.set()
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=timeout)
 
     def _monitor_loop(self):
         while not self._stop_flag.is_set():

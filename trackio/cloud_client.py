@@ -13,6 +13,10 @@ from urllib.parse import quote, urlsplit
 
 import httpx2
 
+import trackio.apple_gpu as apple_metrics
+import trackio.cpu as cpu_metrics
+import trackio.gpu as gpu_metrics
+
 CONFIG_FIELDS = frozenset(
     {
         "learning_rate",
@@ -29,6 +33,7 @@ CONFIG_FIELDS = frozenset(
         "dataset_revision",
         "recipe_digest",
         "dataset_digest",
+        "model/num_parameters",
     }
 )
 
@@ -38,19 +43,39 @@ class CloudConfig(dict):
         super().__init__()
         self.run = run
 
-    def update(self, values=None, *, allow_val_change=False, **kwargs):
-        selected = {
+    @staticmethod
+    def selected(values):
+        return {
             key: value
-            for key, value in {**(values or {}), **kwargs}.items()
+            for key, value in values.items()
             if key in CONFIG_FIELDS
             and isinstance(value, (str, int, float, bool, type(None)))
+            and (not isinstance(value, float) or math.isfinite(value))
+            and (not isinstance(value, str) or len(value) <= 4096)
         }
+
+    def __setitem__(self, key, value):
+        self.update({key: value})
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self.get(key)
+
+    def __ior__(self, values):
+        self.update(values)
+        return self
+
+    def update(self, values=None, *, allow_val_change=False, **kwargs):
+        selected = self.selected({**(values or {}), **kwargs})
         if not selected:
             return
         try:
             with self.run.lock:
                 super().update(selected)
-                self.run._write(self.run.directory / "config.pending", dict(self))
+                self.run._write(
+                    self.run.directory / "config.pending", self.selected(self)
+                )
         except OSError:
             self.run._record_gap()
             return
@@ -67,6 +92,7 @@ class CloudRun:
         *,
         trial_id=None,
         refresh_token=None,
+        categories=None,
         transport=None,
         max_bytes=16 * 1024 * 1024,
     ):
@@ -76,6 +102,13 @@ class CloudRun:
         self.run_id = run_id
         self.endpoint = self.server_url + "/v1/runs/" + quote(run_id, safe="")
         self.trial_id = trial_id
+        if categories is not None and (
+            not isinstance(categories, (list, tuple, set, frozenset))
+            or not categories
+            or set(categories) - {"experiment", "compute"}
+        ):
+            raise ValueError("INVALID_METRICS_CATEGORIES")
+        self.categories = frozenset(categories or ("experiment", "compute"))
         self.name = run_id
         self.max_bytes = max_bytes
         self.directory = Path(spool_dir)
@@ -128,9 +161,17 @@ class CloudRun:
         return self._log(metrics, step, "experiment")
 
     def log_system(self, metrics):
-        return self._log(metrics, None, "compute")
+        if "compute" not in self.categories:
+            return
+        if not isinstance(metrics, dict):
+            raise ValueError("METRICS_DICTIONARY_REQUIRED")
+        items = list(metrics.items())
+        for offset in range(0, len(items), 128):
+            self._log(dict(items[offset : offset + 128]), None, "compute")
 
     def _log(self, metrics, step, category):
+        if category not in self.categories:
+            return
         with self.lock:
             if not isinstance(metrics, dict) or not metrics or len(metrics) > 128:
                 raise ValueError("SCALAR_METRICS_REQUIRED")
@@ -262,6 +303,9 @@ class ManagedCloudRun(CloudRun):
         self.wake = threading.Event()
         self.stopped = threading.Event()
         self.delivery_status = {"committed": False, "pending": 0, "dropped": 0}
+        self.monitors = []
+        self.system_started = False
+        self.closed = False
         previous = self.directory / "delivery-status"
         if previous.exists():
             self.delivery_status["dropped"] = json.loads(previous.read_text())[
@@ -269,6 +313,50 @@ class ManagedCloudRun(CloudRun):
             ]
         self.worker = threading.Thread(target=self._pump, daemon=True)
         self.worker.start()
+
+    def start_system(
+        self,
+        auto_log_gpu=None,
+        auto_log_cpu=None,
+        gpu_log_interval=10,
+        cpu_log_interval=10,
+    ):
+        if "compute" not in self.categories or self.system_started or self.closed:
+            return
+        for interval in (gpu_log_interval, cpu_log_interval):
+            if (
+                type(interval) not in (int, float)
+                or not math.isfinite(interval)
+                or not 1 <= interval <= 3600
+            ):
+                raise ValueError("INVALID_SYSTEM_METRICS_INTERVAL")
+        self.system_started = True
+        choices = []
+        cpu_enabled = auto_log_cpu is True or (
+            auto_log_cpu is None and cpu_metrics.cpu_available()
+        )
+        if auto_log_gpu is not False:
+            if gpu_metrics.gpu_available():
+                choices.append((gpu_metrics.GpuMonitor, {"interval": gpu_log_interval}))
+            elif apple_metrics.apple_gpu_available():
+                choices.append(
+                    (
+                        apple_metrics.AppleGpuMonitor,
+                        {
+                            "interval": gpu_log_interval,
+                            "include_cpu_metrics": not cpu_enabled,
+                        },
+                    )
+                )
+        if cpu_enabled:
+            choices.append((cpu_metrics.CpuMonitor, {"interval": cpu_log_interval}))
+        for monitor_class, options in choices:
+            try:
+                monitor = monitor_class(self, **options)
+                monitor.start()
+                self.monitors.append(monitor)
+            except Exception:
+                self._record_gap()
 
     def _send(self):
         self.wake.set()
@@ -289,7 +377,9 @@ class ManagedCloudRun(CloudRun):
 
     def _log(self, *args):
         try:
-            super()._log(*args)
+            with self.lock:
+                if not self.closed:
+                    super()._log(*args)
         except (OSError, BufferError):
             self._record_gap()
 
@@ -302,7 +392,21 @@ class ManagedCloudRun(CloudRun):
         )
 
     def finish(self, timeout=5):
+        if (
+            type(timeout) not in (int, float)
+            or not math.isfinite(timeout)
+            or timeout < 0
+        ):
+            raise ValueError("INVALID_FINISH_TIMEOUT")
         deadline = time.monotonic() + timeout
+        with self.lock:
+            self.closed = True
+        for monitor in self.monitors:
+            try:
+                monitor.stop(timeout=max(0, min(2, deadline - time.monotonic())))
+            except Exception:
+                self._record_gap()
+        self.monitors.clear()
         self.wake.set()
         while time.monotonic() < deadline:
             pending = len(list(self.directory.glob("*.json"))) + int(
@@ -312,7 +416,7 @@ class ManagedCloudRun(CloudRun):
                 break
             self.stopped.wait(0.05)
         self.stopped.set()
-        self.worker.join(timeout=0.1)
+        self.worker.join(timeout=max(0, min(0.1, deadline - time.monotonic())))
         pending = len(list(self.directory.glob("*.json"))) + int(
             (self.directory / "config.pending").exists()
         )
@@ -334,7 +438,7 @@ class ManagedCloudRun(CloudRun):
         return dict(self.delivery_status)
 
 
-def init_from_context(path, *, config=None):
+def init_from_context(path, *, config=None, system=None):
     context_path = Path(path)
     metadata = context_path.lstat()
     if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
@@ -363,6 +467,12 @@ def init_from_context(path, *, config=None):
         context["spool_dir"],
         trial_id=context.get("trial_id"),
         refresh_token=context.get("refresh_token"),
+        categories=context.get("categories"),
     )
-    run.config.update(config)
+    try:
+        run.config.update(config)
+        run.start_system(**(system or {}))
+    except Exception:
+        run.finish(timeout=0)
+        raise
     return run

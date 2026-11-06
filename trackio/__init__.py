@@ -421,16 +421,23 @@ def init(
     Returns:
         `Run`: A [`Run`] object that can be used to log metrics and finish the run.
     """
+    global _atexit_registered
     if context_file := os.environ.get("TRACKIO_ENVLOOP_CONTEXT_FILE"):
         if space_id or dataset_id or bucket_id or server_url or os.environ.get("TRACKIO_SPACE_ID"):
             raise ValueError("ENVLOOP_METRICS_DESTINATION_IS_PLATFORM_BOUND")
         if context_vars.current_run.get() is not None:
             raise RuntimeError("Finish the active Trackio run before initializing another")
-        run = init_from_context(context_file, config=config)
+        run = init_from_context(context_file, config=config, system={
+            'auto_log_gpu': auto_log_gpu, 'auto_log_cpu': auto_log_cpu,
+            'gpu_log_interval': gpu_log_interval, 'cpu_log_interval': cpu_log_interval})
         context_vars.current_run.set(run)
         context_vars.current_project.set(project)
         context_vars.current_space_id.set(None)
         globals()["config"] = run.config
+        if not _atexit_registered:
+            atexit.register(_cleanup_current_run)
+            _atexit_registered = True
+        _install_sigterm_handler()
         return run
     SQLiteStorage.validate_project_name(project)
 
@@ -731,7 +738,6 @@ def init(
                 f"trackio.init() could not inspect pending buffered data for project '{project}': {e}. Logging will continue."
             )
 
-    global _atexit_registered
     if not _atexit_registered:
         atexit.register(_cleanup_current_run)
         _atexit_registered = True
