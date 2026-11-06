@@ -77,7 +77,7 @@ class CloudConfig(dict):
                 self.run._write(
                     self.run.directory / "config.pending", self.selected(self)
                 )
-        except OSError:
+        except (OSError, BufferError):
             self.run._record_gap()
             return
         self.run._send()
@@ -144,11 +144,15 @@ class CloudRun(RichCloudRun):
             self._write(self.state_path, self.state)
 
     def _write(self, path, payload):
+        encoded = json.dumps(payload, allow_nan=False, separators=(",", ":"))
+        previous_size = path.stat().st_size if path.exists() else 0
+        if self._spool_size() - previous_size + len(encoded.encode()) > self.max_bytes:
+            raise BufferError("METRICS_SPOOL_FULL")
         temporary = path.with_suffix("." + uuid.uuid4().hex + ".tmp")
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(descriptor, "w") as stream:
-                json.dump(payload, stream, allow_nan=False, separators=(",", ":"))
+                stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
@@ -218,11 +222,7 @@ class CloudRun(RichCloudRun):
             }
             payload = {"batch_id": event_id, "events": [event]}
             size = len(json.dumps(payload).encode())
-            if (
-                sum(path.stat().st_size for path in self.directory.glob("*.json"))
-                + size
-                > self.max_bytes
-            ):
+            if self._spool_size() + size > self.max_bytes:
                 raise BufferError("METRICS_SPOOL_FULL")
             self._write(
                 self.directory / (str(time.time_ns()) + "-" + event_id + ".json"),
@@ -243,6 +243,7 @@ class CloudRun(RichCloudRun):
         with self.flush_lock:
             config_path = self.directory / "config.pending"
             with self.lock:
+                self._collect_spool_objects()
                 config = config_path.read_bytes() if config_path.exists() else None
                 paths = sorted(self.directory.glob("*.json"))
             if config is not None:

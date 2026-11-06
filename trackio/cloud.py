@@ -1115,7 +1115,9 @@ def main():
         action="store_true",
         help="Explicitly initialize the additive schema, then exit",
     )
-    schema_action.add_argument("--migrate-from", choices=[1], type=int)
+    schema_action.add_argument(
+        "--migrate-from", choices=range(1, SCHEMA_VERSION), type=int
+    )
     parser.add_argument("--owner-role")
     args = parser.parse_args()
     config = CloudConfig.from_file(args.config)
