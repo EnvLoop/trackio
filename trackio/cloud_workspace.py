@@ -1099,7 +1099,13 @@ class WorkspaceRepository(MetricsRepository):
         self._workspace_fence(connection, claims["run_id"])
 
     def read_records(self, scope, kind=None, after=None):
+        scope = scoped(scope)
         with self.engine.begin() as connection:
+            existing = connection.execute(
+                select(self.runs.c.run_id).where(self.runs.c.run_id == scope["run_id"])
+            ).scalar_one_or_none()
+            if existing is None:
+                return []
             self.workspace._lock(connection, scope)
             return super().read_records(scope, kind, after)
 
