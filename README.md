@@ -22,7 +22,7 @@
 
 Welcome to `trackio`: a lightweight, <u>free</u> experiment tracking library built by Hugging Face for humans and AI agents 🤗. 
 
-EnvLoop fork component **0.46.0**: managed SDK, explicit cloud schema migration,
+EnvLoop fork component **0.46.1**: managed SDK, explicit cloud schema migration,
 artifacts/registry/logbooks, offline import and scoped query/export contracts are
 documented in [EnvLoop workspace integration](docs/envloop-workspace.md).
 
