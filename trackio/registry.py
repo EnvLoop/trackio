@@ -1,3 +1,4 @@
+import importlib
 from dataclasses import dataclass
 
 from trackio.registry_bucket import BucketRegistryStorage
@@ -87,6 +88,19 @@ class Registry:
         registry.collection("my-model").links
         ```
     """
+
+    def __new__(cls, name: str, bucket_id: str | None = None):
+        mode = importlib.import_module("trackio.cloud_mode")
+        if mode.is_managed():
+            run = mode.managed_run()
+            if run is None:
+                raise RuntimeError("ACTIVE_MANAGED_RUN_REQUIRED")
+            return (
+                importlib.import_module("trackio.cloud_api")
+                .CloudApi(run=run)
+                .registry(name, bucket_id=bucket_id)
+            )
+        return super().__new__(cls)
 
     def __init__(self, name: str, bucket_id: str | None = None):
         validate_registry_name(name)

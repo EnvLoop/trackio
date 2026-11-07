@@ -286,6 +286,9 @@ class Artifact:
     def wait(self, timeout: int | None = None) -> "Artifact":
         """No-op: trackio logs artifacts synchronously, so the artifact is
         already committed by the time `log_artifact` returns."""
+        if cloud := getattr(self, "_cloud_artifact", None):
+            cloud.wait(timeout)
+            return self
         if not self._logged:
             raise RuntimeError(
                 "Cannot wait on an Artifact that has not been logged; "
@@ -526,6 +529,8 @@ class Artifact:
         Returns:
             The absolute path to the download directory, as a string.
         """
+        if cloud := getattr(self, "_cloud_artifact", None):
+            return cloud.download(root)
         if not self._logged:
             raise RuntimeError(
                 "Cannot download an Artifact that has not been logged or fetched."
@@ -603,6 +608,8 @@ class Artifact:
         Returns:
             The linked artifact at its registry location.
         """
+        if getattr(self, "_cloud_artifact", None) is not None:
+            return self._cloud_artifact.link(target_path, aliases, bucket_id)
         if not self._logged:
             raise RuntimeError(
                 "Cannot link an Artifact that has not been logged or fetched. "
@@ -624,6 +631,8 @@ class Artifact:
         collection version number is never reused. If the version held
         `latest`, that alias moves to the highest remaining version.
         """
+        if getattr(self, "_cloud_artifact", None) is not None:
+            return self._cloud_artifact.unlink()
         if not self.is_link:
             raise ValueError(
                 "unlink() removes a registry link; call it on the linked "

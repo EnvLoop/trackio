@@ -10,6 +10,20 @@ from trackio import context_vars
 from trackio.media import write_audio, write_video
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--cloud",
+        action="store_true",
+        default=False,
+        help="Run the optional cloud suite with its explicit dependencies and local PostgreSQL",
+    )
+
+
+def pytest_ignore_collect(collection_path, config):
+    if collection_path.name == "cloud" and collection_path.is_dir():
+        return not config.getoption("--cloud")
+
+
 @pytest.fixture
 def temp_dir(monkeypatch):
     """Fixture that creates a temporary TRACKIO_DIR."""

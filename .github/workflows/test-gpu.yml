@@ -21,6 +21,7 @@ on:
 
 jobs:
   gpu-test:
+    if: github.repository == 'gradio-app/trackio'
     runs-on: hf-jobs-t4-small
     defaults:
       run:

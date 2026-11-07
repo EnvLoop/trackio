@@ -1,3 +1,4 @@
+import importlib
 from typing import Iterator
 
 from trackio.registry import Registry
@@ -83,6 +84,21 @@ class Runs:
 
 
 class Api:
+    def __new__(cls, *, server_url=None, token=None, scope=None, transport=None):
+        mode = importlib.import_module("trackio.cloud_mode")
+        if server_url is not None or mode.is_managed():
+            run = mode.managed_run()
+            if server_url is None and run is None:
+                raise RuntimeError("ACTIVE_CLOUD_RUN_OR_EXPLICIT_CONNECTION_REQUIRED")
+            return importlib.import_module("trackio.cloud_api").CloudApi(
+                run=run if server_url is None else None,
+                server_url=server_url,
+                token=token,
+                scope=scope,
+                transport=transport,
+            )
+        return super().__new__(cls)
+
     def runs(self, project: str) -> Runs:
         if not SQLiteStorage.get_project_db_path(project).exists():
             raise ValueError(f"Project '{project}' does not exist")

@@ -1,11 +1,13 @@
 import atexit
 import glob
+import importlib
 import json
 import logging
 import os
 import shutil
 import signal
 import threading
+import uuid
 import warnings
 import webbrowser
 from pathlib import Path
@@ -31,6 +33,7 @@ from trackio.api import Api
 from trackio.apple_gpu import apple_gpu_available
 from trackio.apple_gpu import log_apple_gpu as _log_apple_gpu
 from trackio.artifact import Artifact
+from trackio.cloud_client import init_from_context
 from trackio.console import resolve_capture_console
 from trackio.cpu import cpu_available
 from trackio.cpu import log_cpu as _log_cpu
@@ -420,6 +423,39 @@ def init(
     Returns:
         `Run`: A [`Run`] object that can be used to log metrics and finish the run.
     """
+    global _atexit_registered
+    if context_file := os.environ.get("TRACKIO_ENVLOOP_CONTEXT_FILE"):
+        if (
+            space_id
+            or dataset_id
+            or bucket_id
+            or server_url
+            or os.environ.get("TRACKIO_SPACE_ID")
+        ):
+            raise ValueError("ENVLOOP_METRICS_DESTINATION_IS_PLATFORM_BOUND")
+        if context_vars.current_run.get() is not None:
+            raise RuntimeError(
+                "Finish the active Trackio run before initializing another"
+            )
+        run = init_from_context(
+            context_file,
+            config=config,
+            system={
+                "auto_log_gpu": auto_log_gpu,
+                "auto_log_cpu": auto_log_cpu,
+                "gpu_log_interval": gpu_log_interval,
+                "cpu_log_interval": cpu_log_interval,
+            },
+        )
+        context_vars.current_run.set(run)
+        context_vars.current_project.set(project)
+        context_vars.current_space_id.set(None)
+        globals()["config"] = run.config
+        if not _atexit_registered:
+            atexit.register(_cleanup_current_run)
+            _atexit_registered = True
+        _install_sigterm_handler()
+        return run
     SQLiteStorage.validate_project_name(project)
 
     if settings is not None:
@@ -719,7 +755,6 @@ def init(
                 f"trackio.init() could not inspect pending buffered data for project '{project}': {e}. Logging will continue."
             )
 
-    global _atexit_registered
     if not _atexit_registered:
         atexit.register(_cleanup_current_run)
         _atexit_registered = True
@@ -987,6 +1022,8 @@ def delete_project(project: str, force: bool = False) -> bool:
     Returns:
         `bool`: `True` if the project was deleted, `False` otherwise.
     """
+    if importlib.import_module("trackio.cloud_mode").is_managed():
+        raise PermissionError("PROJECT_DELETE_REQUIRES_SCOPED_SERVICE_API")
     db_path = SQLiteStorage.get_project_db_path(project)
 
     if not db_path.exists():
@@ -1058,6 +1095,35 @@ def save(
         trackio.save("models/*.pth")
         ```
     """
+    mode = importlib.import_module("trackio.cloud_mode")
+    if mode.is_managed():
+        run = mode.managed_run()
+        if run is None:
+            raise RuntimeError("ACTIVE_MANAGED_RUN_REQUIRED")
+        if project is not None:
+            if any(
+                value["project_id"] != project
+                for value in run._workspace_query("list")["runs"]
+            ):
+                raise PermissionError("PROJECT_SCOPE_MISMATCH")
+        paths = [
+            Path(value)
+            for value in glob.glob(str(glob_str), recursive=True)
+            if Path(value).is_file()
+        ]
+        if not paths:
+            raise ValueError("NO_MATCHING_FILES")
+        artifact = Artifact("saved-" + uuid.uuid4().hex, "files")
+        base = Path.cwd().resolve()
+        for path in paths:
+            logical = (
+                str(path.resolve().relative_to(base))
+                if path.resolve().is_relative_to(base)
+                else path.name
+            )
+            artifact.add_file(path, logical)
+        result = run.log_artifact(artifact)
+        return "cloud-artifact:" + run.run_id + ":" + result.name
     if project is None:
         project = context_vars.current_project.get()
         if project is None:
@@ -1246,6 +1312,12 @@ def show(
             `share_url`: The public share URL, if any.
             `full_url`: The full URL including the write token (share URL when sharing, else local).
     """
+    mode = importlib.import_module("trackio.cloud_mode")
+    if mode.is_managed():
+        run = mode.managed_run()
+        if run is None:
+            raise RuntimeError("ACTIVE_MANAGED_RUN_REQUIRED")
+        return {"url": run.server_url, "mode": "managed", "run_id": run.run_id}
     if dashboard not in (None, "registry"):
         raise ValueError("dashboard must be None or 'registry'.")
     if dashboard == "registry" and project is not None:

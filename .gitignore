@@ -19,3 +19,4 @@ screenshots/
 examples/mock_logbook_session/
 examples/files/object3d/
 .worktrees/
+.ea/

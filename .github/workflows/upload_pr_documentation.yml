@@ -8,6 +8,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'gradio-app/trackio'
     uses: huggingface/doc-builder/.github/workflows/upload_pr_documentation.yml@main
     with:
       package_name: trackio

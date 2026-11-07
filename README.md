@@ -22,6 +22,10 @@
 
 Welcome to `trackio`: a lightweight, <u>free</u> experiment tracking library built by Hugging Face for humans and AI agents 🤗. 
 
+EnvLoop fork component **0.46.0**: managed SDK, explicit cloud schema migration,
+artifacts/registry/logbooks, offline import and scoped query/export contracts are
+documented in [EnvLoop workspace integration](docs/envloop-workspace.md).
+
 **Why Trackio when other experiment-tracking libraries exist?** Trackio has a few qualities that make it particularly useful for  agents: 
 * It is local-first, because you shouldn't need to make an account to log data
 * Logs are stored in SQLite database (with support for "freezing" logs to Parquet), which not only lets Trackio supports very high throughputs for parallel experiments, but also

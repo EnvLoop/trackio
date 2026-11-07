@@ -11,6 +11,7 @@ permissions: {}
 
 jobs:
   cleanup:
+    if: github.repository == 'gradio-app/trackio'
     name: "cleanup-e2e-space"
     runs-on: ubuntu-latest
     steps:
