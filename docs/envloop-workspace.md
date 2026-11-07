@@ -1,4 +1,4 @@
-# EnvLoop Trackio component 0.46.0
+# EnvLoop Trackio component 0.46.1
 
 This fork adds a managed cloud SDK and service alongside the original local
 Trackio implementation. The component version is read from
