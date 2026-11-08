@@ -102,6 +102,7 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
         self.token = token
         self.refresh_token = refresh_token
         self.run_id = run_id
+        self._space_id = None
         self.closed = False
         self.summary = CloudSummary(self)
         self.endpoint = self.server_url + "/v1/runs/" + quote(run_id, safe="")
