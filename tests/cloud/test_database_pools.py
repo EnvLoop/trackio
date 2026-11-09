@@ -7,10 +7,83 @@ from sqlalchemy import event, text
 from sqlalchemy.exc import TimeoutError as PoolTimeout
 from starlette.testclient import TestClient
 
-from trackio.cloud import CloudConfig, MetricsRepository, create_app
+from trackio.cloud import CloudConfig, Conflict, MetricsRepository, create_app
 from trackio.cloud_objects import FileObjects
 from trackio.cloud_pools import database_workload
 from trackio.cloud_workspace import WorkspaceRepository
+
+
+def test_bulk_append_bounds_round_trips_and_keeps_idempotency_and_atomic_conflicts(
+    workspace_database,
+):
+    url, schema = workspace_database
+    repository = WorkspaceRepository(url, schema=schema, initialize_workspace=True)
+    scope = dict(workspace_id="w", project_id="p", job_id="j", run_id="r")
+    repository.bind(**scope, config={})
+    capability = repository.capability(scope, None, None)
+    events = [
+        dict(
+            event_id=f"event{index}",
+            writer_id="writer",
+            trial_id=None,
+            step=index,
+            observed_at=index,
+            category="experiment",
+            metrics={"loss": index},
+        )
+        for index in range(100)
+    ]
+    statements = []
+
+    def observe(connection, cursor, statement, parameters, context, many):
+        statements.append(statement)
+
+    try:
+        event.listen(repository.engine, "before_cursor_execute", observe)
+        assert (
+            repository.append(
+                **scope,
+                batch={"batch_id": "first", "events": events},
+                capability_id=capability["capability_id"],
+            )
+            == 100
+        )
+        assert len(statements) <= 10
+        event.remove(repository.engine, "before_cursor_execute", observe)
+        assert (
+            repository.append(
+                **scope,
+                batch={"batch_id": "first", "events": events},
+                capability_id=capability["capability_id"],
+            )
+            == 0
+        )
+        extra = {**events[0], "event_id": "extra"}
+        assert (
+            repository.append(
+                **scope,
+                batch={"batch_id": "overlap", "events": [*events, extra]},
+                capability_id=capability["capability_id"],
+            )
+            == 1
+        )
+        with pytest.raises(Conflict, match="EVENT_CONTENT_CONFLICT"):
+            repository.append(
+                **scope,
+                batch={
+                    "batch_id": "conflict",
+                    "events": [
+                        {**extra, "event_id": "must_rollback"},
+                        {**events[0], "metrics": {"loss": -1}},
+                    ],
+                },
+                capability_id=capability["capability_id"],
+            )
+        assert (
+            len(repository.events(workspace_id="w", project_id="p", job_id="j")) == 101
+        )
+    finally:
+        repository.close()
 
 
 def test_postgres_reads_and_writes_use_fixed_independent_pools(postgres_database):

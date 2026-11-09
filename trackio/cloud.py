@@ -692,6 +692,7 @@ class MetricsRepository(RichRepository):
     ):
         validate_batch(batch)
         digest = hashlib.sha256(canonical(batch).encode()).hexdigest()
+        encoded = [(event, canonical(event)) for event in batch["events"]]
         with self.engine.begin() as connection:
             matched = connection.execute(
                 self.runs.update()
@@ -719,21 +720,25 @@ class MetricsRepository(RichRepository):
                 if previous != digest:
                     raise Conflict("BATCH_CONTENT_CONFLICT")
                 return 0
-            accepted = 0
-            for event in batch["events"]:
-                payload = canonical(event)
-                previous = connection.execute(
-                    select(self.records.c.payload).where(
+            existing = dict(
+                connection.execute(
+                    select(self.records.c.event_id, self.records.c.payload).where(
                         self.records.c.run_id == run_id,
-                        self.records.c.event_id == event["event_id"],
+                        self.records.c.event_id.in_(
+                            [event["event_id"] for event, _ in encoded]
+                        ),
                     )
-                ).scalar_one_or_none()
+                ).all()
+            )
+            pending = []
+            for event, payload in encoded:
+                previous = existing.get(event["event_id"])
                 if previous is not None:
                     if previous != payload:
                         raise Conflict("EVENT_CONTENT_CONFLICT")
                     continue
-                connection.execute(
-                    self.records.insert().values(
+                pending.append(
+                    dict(
                         run_id=run_id,
                         event_id=event["event_id"],
                         observed_at=event["observed_at"],
@@ -741,13 +746,14 @@ class MetricsRepository(RichRepository):
                         payload=payload,
                     )
                 )
-                accepted += 1
+            if pending:
+                connection.execute(self.records.insert(), pending)
             connection.execute(
                 self.batches.insert().values(
                     run_id=run_id, batch_id=batch["batch_id"], digest=digest
                 )
             )
-            return accepted
+            return len(pending)
 
     def events(
         self,
