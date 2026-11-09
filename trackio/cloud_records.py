@@ -209,7 +209,7 @@ class RichRepository:
         with (
             nullcontext(connection)
             if connection is not None
-            else self.engine.connect() as connection
+            else self.read_connection() as connection
         ):
             rows = (
                 connection.execute(
@@ -227,7 +227,7 @@ class RichRepository:
     def read_object(self, scope, digest, storage):
         if storage is None:
             raise ValueError("OBJECT_STORAGE_NOT_CONFIGURED")
-        with self.engine.connect() as connection:
+        with self.read_connection() as connection:
             row = self._object_metadata(connection, scope, digest)
         return storage.get(row["object_key"], digest, row["size"])
 

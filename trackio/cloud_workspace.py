@@ -44,6 +44,9 @@ class WorkspaceStore:
     def engine(self):
         return self.repository.engine
 
+    def read_connection(self):
+        return self.repository.read_connection()
+
     def __init__(
         self,
         repository,
@@ -724,7 +727,7 @@ class WorkspaceStore:
         )
         results = []
         scanned = 0
-        with self.engine.connect() as connection:
+        with self.read_connection() as connection:
             for row in connection.execute(statement).mappings():
                 scanned += 1
                 if scanned > 5000:

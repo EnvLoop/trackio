@@ -11,9 +11,8 @@ import re
 import secrets
 import stat
 import sys
-import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +32,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import TimeoutError as PoolTimeout
 from sqlalchemy.schema import CreateSchema
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
@@ -42,7 +42,7 @@ from starlette.routing import Route
 
 from trackio import cloud_server
 from trackio.cloud_objects import MAX_OBJECT_BYTES
-from trackio.cloud_pools import current_workload, database_workload, validate_pool_sizes
+from trackio.cloud_pools import validate_pool_sizes
 from trackio.cloud_records import RichRepository, rich_tables
 
 if sys.version_info >= (3, 11):
@@ -274,14 +274,6 @@ class MetricsRepository(RichRepository):
             raise ValueError("UNSUPPORTED_DATABASE")
         validate_pool_sizes(write_pool_size, read_pool_size)
         self.url = url
-        self.request_limits = (
-            {
-                "write": threading.BoundedSemaphore(write_pool_size),
-                "read": threading.BoundedSemaphore(read_pool_size),
-            }
-            if url.startswith("postgresql")
-            else {}
-        )
         options = dict(
             pool_pre_ping=True,
             hide_parameters=True,
@@ -466,7 +458,14 @@ class MetricsRepository(RichRepository):
 
     @property
     def engine(self):
-        return self._engines[current_workload()]
+        return self._engines["write"]
+
+    @contextmanager
+    def read_connection(self):
+        with self._engines["read"].connect() as connection:
+            if connection.dialect.name == "postgresql":
+                connection.execute(text("SET TRANSACTION READ ONLY"))
+            yield connection
 
     def close(self):
         for engine in set(self._engines.values()):
@@ -537,7 +536,7 @@ class MetricsRepository(RichRepository):
             }
 
     def authorize_capability(self, capability_id):
-        with self.engine.connect() as connection:
+        with self.read_connection() as connection:
             row = (
                 connection.execute(
                     select(
@@ -621,7 +620,7 @@ class MetricsRepository(RichRepository):
             with self.engine.begin() as connection:
                 connection.execute(self.runs.insert().values(**values))
         except IntegrityError:
-            with self.engine.connect() as connection:
+            with self.read_connection() as connection:
                 existing = (
                     connection.execute(
                         select(self.runs).where(self.runs.c.run_id == run_id)
@@ -677,7 +676,7 @@ class MetricsRepository(RichRepository):
             raise PermissionError("CAPABILITY_REVOKED_OR_EXPIRED")
 
     def authorize_legacy(self, claims):
-        with self.engine.connect() as connection:
+        with self.read_connection() as connection:
             self._live_legacy(connection, claims)
 
     def append(
@@ -794,7 +793,7 @@ class MetricsRepository(RichRepository):
             self.records.c.observed_at, self.records.c.event_id
         ).limit(limit)
         results = []
-        with self.engine.connect() as connection:
+        with self.read_connection() as connection:
             for payload, run_id in connection.execute(statement):
                 record = {**json.loads(payload), "run_id": run_id}
                 if trial_id is None or record["trial_id"] == trial_id:
@@ -908,7 +907,7 @@ def create_app(config, repository=None, *, objects=None):
         return json.loads(content)
 
     def ready(request):
-        with repository.engine.connect() as connection:
+        with repository.read_connection() as connection:
             connection.execute(select(repository.schema.c.version)).one()
             workspace_version = (
                 connection.execute(
@@ -1183,33 +1182,14 @@ def create_app(config, repository=None, *, objects=None):
     )
 
     async def no_cache(request, call_next):
-        from sqlalchemy.exc import TimeoutError as PoolTimeout
-
-        workload = (
-            "read"
-            if request.method in {"GET", "HEAD"}
-            or request.url.path in {"/v1/workspace/query", "/v1/workspace/legacy-file"}
-            else "write"
-        )
-        limit = repository.request_limits.get(workload)
-        if limit is not None and not limit.acquire(blocking=False):
-            return JSONResponse(
+        try:
+            response = await call_next(request)
+        except PoolTimeout:
+            response = JSONResponse(
                 {"error": "DATABASE_BUSY"},
                 status_code=503,
-                headers={"Retry-After": "1", "Cache-Control": "no-store"},
+                headers={"Retry-After": "1"},
             )
-        with database_workload(workload):
-            try:
-                response = await call_next(request)
-            except PoolTimeout:
-                response = JSONResponse(
-                    {"error": "DATABASE_BUSY"},
-                    status_code=503,
-                    headers={"Retry-After": "1"},
-                )
-            finally:
-                if limit is not None:
-                    limit.release()
         response.headers["Cache-Control"] = "no-store"
         return response
 

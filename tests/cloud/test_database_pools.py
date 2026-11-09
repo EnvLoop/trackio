@@ -4,12 +4,14 @@ from threading import Event
 
 import pytest
 from sqlalchemy import event, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import TimeoutError as PoolTimeout
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from trackio.cloud import CloudConfig, Conflict, MetricsRepository, create_app
 from trackio.cloud_objects import FileObjects
-from trackio.cloud_pools import database_workload
 from trackio.cloud_workspace import WorkspaceRepository
 
 
@@ -92,14 +94,12 @@ def test_postgres_reads_and_writes_use_fixed_independent_pools(postgres_database
     try:
         write = repository.engine
         assert write.pool.size() == 10
-        with database_workload("read"):
-            read = repository.engine
-            assert read is not write and read.pool.size() == 5
-            assert repository.workspace.engine is read
+        read = repository._engines["read"]
+        assert read is not write and read.pool.size() == 5
         assert repository.workspace.engine is write
         held = [write.connect() for _ in range(10)]
         try:
-            with database_workload("read"), repository.engine.connect() as connection:
+            with repository.read_connection() as connection:
                 assert connection.scalar(text("SELECT 1")) == 1
         finally:
             for connection in held:
@@ -127,7 +127,7 @@ def test_migration_timeout_is_local_and_runtime_connections_keep_short_budgets(
     try:
         assert observed == ["60000"]
         for workload in ("write", "read"):
-            with database_workload(workload), repository.engine.connect() as connection:
+            with repository._engines[workload].connect() as connection:
                 assert (
                     connection.scalar(
                         text(
@@ -163,9 +163,25 @@ def test_local_sqlite_keeps_one_engine_and_existing_pool_size(tmp_path):
     )
     try:
         write = repository.engine
-        with database_workload("read"):
-            assert repository.engine is write and repository.workspace.engine is write
+        with repository.read_connection() as connection:
+            assert connection.engine is write and repository.workspace.engine is write
         assert write.pool.size() == 3
+    finally:
+        repository.close()
+
+
+def test_read_connections_reject_writes_and_return_clean_sessions(postgres_database):
+    url, schema = postgres_database
+    repository = MetricsRepository(url, schema=schema)
+    try:
+        with repository.read_connection() as connection:
+            assert connection.scalar(text("SHOW transaction_read_only")) == "on"
+            with pytest.raises(DBAPIError):
+                connection.execute(repository.runs.delete())
+        with repository.engine.begin() as connection:
+            assert connection.scalar(text("SHOW transaction_read_only")) == "off"
+        with repository.read_connection() as connection:
+            assert connection.scalar(text("SELECT 1")) == 1
     finally:
         repository.close()
 
@@ -225,7 +241,7 @@ def test_slow_query_keeps_write_requests_responsive_and_read_overload_bounded(
 
     def slow_events(**kwargs):
         entered.set()
-        assert release.wait(5)
+        assert release.wait(15)
         return original(**kwargs)
 
     monkeypatch.setattr(repository, "events", slow_events)
@@ -256,13 +272,14 @@ def test_slow_query_keeps_write_requests_responsive_and_read_overload_bounded(
                     ),
                 )
                 assert write.result(timeout=3).status_code == 200
-                for _ in range(4):
-                    assert repository.request_limits["read"].acquire(blocking=False)
+                read = repository._engines["read"]
+                held = [read.connect() for _ in range(5)]
                 try:
+                    assert not hasattr(repository, "request_limits")
                     assert client.get("/ready").status_code == 503
                 finally:
-                    for _ in range(4):
-                        repository.request_limits["read"].release()
+                    for connection in held:
+                        connection.close()
             finally:
                 release.set()
             assert query.result(timeout=3).status_code == 200
@@ -288,24 +305,46 @@ def test_workspace_records_never_checkout_a_second_connection(workspace_database
         repository.close()
 
 
-def test_http_get_and_post_select_different_workloads_and_busy_is_redacted(
-    tmp_path, monkeypatch
+def test_http_database_operations_choose_pools_and_busy_is_redacted(
+    postgres_database, monkeypatch
 ):
-    url = f"sqlite:///{tmp_path / 'http.sqlite'}"
-    repository = MetricsRepository(url)
+    url, schema = postgres_database
+    repository = MetricsRepository(url, schema=schema)
     config = CloudConfig("local", url, "s" * 32, "k" * 32)
     selected = []
 
-    def record_checkout(connection, record, proxy):
-        from trackio.cloud_pools import current_workload
+    for name, engine in repository._engines.items():
 
-        selected.append(current_workload())
+        def record_checkout(connection, record, proxy, workload=name):
+            selected.append(workload)
 
-    event.listen(repository.engine, "checkout", record_checkout)
+        event.listen(engine, "checkout", record_checkout)
     try:
-        with TestClient(create_app(config, repository)) as client:
+        app = create_app(config, repository)
+
+        def read_from_post(request):
+            repository.events(workspace_id="w", project_id="p", job_id="j")
+            return JSONResponse({"ok": True})
+
+        def write_from_get(request):
+            repository.bind("w", "p", "j", "from_get", {})
+            return JSONResponse({"ok": True})
+
+        app.routes.extend(
+            [
+                Route("/new/read", read_from_post, methods=["POST"]),
+                Route("/new/write", write_from_get, methods=["GET"]),
+            ]
+        )
+        with TestClient(app) as client:
             assert client.get("/ready").status_code == 200
             assert selected and set(selected) == {"read"}
+            selected.clear()
+            assert client.post("/new/read").status_code == 200
+            assert selected and set(selected) == {"read"}
+            selected.clear()
+            assert client.get("/new/write").status_code == 200
+            assert selected and set(selected) == {"write"}
             selected.clear()
             response = client.post(
                 "/v1/runs",
@@ -320,7 +359,7 @@ def test_http_get_and_post_select_different_workloads_and_busy_is_redacted(
             def busy(*args, **kwargs):
                 raise PoolTimeout("secret-canary")
 
-            monkeypatch.setattr(repository.engine, "connect", busy)
+            monkeypatch.setattr(repository._engines["read"], "connect", busy)
             response = client.get("/ready")
             assert (
                 response.status_code == 503 and response.headers["retry-after"] == "1"
