@@ -45,7 +45,7 @@ artifact/registry operations, project browsing and lifecycle controls, complete
 legacy migration, public read proxies and dual release/deployment integration
 still require their own implementation and acceptance evidence. Local PostgreSQL
 and filesystem tests do not prove real R2 credentials or a deployed service.
-# Connection capacity
+
+## Connection capacity
 
 See [cloud database pools](envloop-cloud-pools.md) for PostgreSQL read/write budgets, SQLite compatibility, request admission and object-read transaction boundaries.
-
