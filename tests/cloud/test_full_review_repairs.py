@@ -483,7 +483,8 @@ def test_full02_postgres_holds_run_lock_until_query_read_completes(
             json={**scope, "config": {}},
             headers={"Authorization": "Bearer " + "s" * 32},
         ).json()
-        event.listen(repository.engine, "before_cursor_execute", observe)
+        for engine in set(repository._engines.values()):
+            event.listen(engine, "before_cursor_execute", observe)
         try:
             with (
                 ThreadPoolExecutor(
@@ -534,7 +535,8 @@ def test_full02_postgres_holds_run_lock_until_query_read_completes(
             )
         finally:
             release.set()
-            event.remove(repository.engine, "before_cursor_execute", observe)
+            for engine in set(repository._engines.values()):
+                event.remove(engine, "before_cursor_execute", observe)
             repository.close()
 
 

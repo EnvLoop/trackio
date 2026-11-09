@@ -40,6 +40,13 @@ def scoped(value):
 
 
 class WorkspaceStore:
+    @property
+    def engine(self):
+        return self.repository.engine
+
+    def read_connection(self):
+        return self.repository.read_connection()
+
     def __init__(
         self,
         repository,
@@ -50,7 +57,6 @@ class WorkspaceStore:
         migrate_from=None,
     ):
         self.repository = repository
-        self.engine = repository.engine
         self._connection = ContextVar("workspace_connection", default=None)
         metadata = MetaData(schema=repository.runs.schema)
         self.schema = Table(
@@ -721,7 +727,7 @@ class WorkspaceStore:
         )
         results = []
         scanned = 0
-        with self.engine.connect() as connection:
+        with self.read_connection() as connection:
             for row in connection.execute(statement).mappings():
                 scanned += 1
                 if scanned > 5000:
@@ -1107,14 +1113,24 @@ class WorkspaceRepository(MetricsRepository):
             if existing is None:
                 return []
             self.workspace._lock(connection, scope)
-            return super().read_records(scope, kind, after)
+            return super().read_records(scope, kind, after, connection=connection)
 
     def read_object(self, scope, digest, storage, *, claims=None):
+        if storage is None:
+            raise ValueError("OBJECT_STORAGE_NOT_CONFIGURED")
         with self.engine.begin() as connection:
             if claims is not None:
                 self._rich_guard(connection, claims)
             self.workspace._lock(connection, scope)
-            return super().read_object(scope, digest, storage)
+            row = dict(self._object_metadata(connection, scope, digest))
+        payload = storage.get(row["object_key"], digest, row["size"])
+        with self.engine.begin() as connection:
+            if claims is not None:
+                self._rich_guard(connection, claims)
+            self.workspace._lock(connection, scope)
+            if dict(self._object_metadata(connection, scope, digest)) != row:
+                raise PermissionError("RUN_SCOPE_MISMATCH")
+        return payload
 
     def put_object(self, claims, digest, payload, content_type, storage):
         return self._put_object(

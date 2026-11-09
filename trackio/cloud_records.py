@@ -2,6 +2,7 @@ import hashlib
 import json
 import re
 import time
+from contextlib import nullcontext
 
 from sqlalchemy import Column, Float, Integer, String, Table, Text, func, select
 
@@ -196,7 +197,7 @@ class RichRepository:
             )
             return 1
 
-    def read_records(self, scope, kind=None, after=None):
+    def read_records(self, scope, kind=None, after=None, *, connection=None):
         conditions = [
             self.runs.c[key] == scope[key]
             for key in ("workspace_id", "project_id", "job_id", "run_id")
@@ -205,7 +206,11 @@ class RichRepository:
             conditions.append(self.documents.c.kind == kind)
         if after is not None:
             conditions.append(self.documents.c.record_id > after)
-        with self.engine.connect() as connection:
+        with (
+            nullcontext(connection)
+            if connection is not None
+            else self.read_connection() as connection
+        ):
             rows = (
                 connection.execute(
                     select(self.documents.c.payload)
@@ -222,27 +227,31 @@ class RichRepository:
     def read_object(self, scope, digest, storage):
         if storage is None:
             raise ValueError("OBJECT_STORAGE_NOT_CONFIGURED")
-        with self.engine.connect() as connection:
-            row = (
-                connection.execute(
-                    select(self.objects)
-                    .join(self.runs, self.runs.c.run_id == self.objects.c.run_id)
-                    .where(
-                        *[
-                            self.runs.c[key] == scope[key]
-                            for key in (
-                                "workspace_id",
-                                "project_id",
-                                "job_id",
-                                "run_id",
-                            )
-                        ],
-                        self.objects.c.digest == digest,
-                    )
+        with self.read_connection() as connection:
+            row = self._object_metadata(connection, scope, digest)
+        return storage.get(row["object_key"], digest, row["size"])
+
+    def _object_metadata(self, connection, scope, digest):
+        row = (
+            connection.execute(
+                select(self.objects)
+                .join(self.runs, self.runs.c.run_id == self.objects.c.run_id)
+                .where(
+                    *[
+                        self.runs.c[key] == scope[key]
+                        for key in (
+                            "workspace_id",
+                            "project_id",
+                            "job_id",
+                            "run_id",
+                        )
+                    ],
+                    self.objects.c.digest == digest,
                 )
-                .mappings()
-                .one_or_none()
             )
+            .mappings()
+            .one_or_none()
+        )
         if row is None:
             raise PermissionError("RUN_SCOPE_MISMATCH")
-        return storage.get(row["object_key"], digest, row["size"])
+        return row
