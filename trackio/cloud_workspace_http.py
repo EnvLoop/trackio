@@ -4,6 +4,7 @@ import hmac
 import importlib
 import json
 
+from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
@@ -56,8 +57,11 @@ def install_routes(app, config, repository, objects):
         return value
 
     async def query(request):
-        claims = authorization(request)
+        claims = await run_in_threadpool(authorization, request)
         data = await read_body(request)
+        return await run_in_threadpool(query_transaction, data, claims)
+
+    def query_transaction(data, claims):
         with store.transaction(claims):
             return query_data(data, claims)
 
@@ -157,18 +161,23 @@ def install_routes(app, config, repository, objects):
         return JSONResponse(result)
 
     async def publish(request):
-        claims = authorization(request)
+        claims = await run_in_threadpool(authorization, request)
         data = await read_body(request)
         scope = effective_scope(data, claims)
-        result = change(store, scope, {"action": "publish", **data}, claims=claims)
+        result = await run_in_threadpool(
+            change, store, scope, {"action": "publish", **data}, claims=claims
+        )
         return JSONResponse(
             {"committed": True, "operation_id": data["operation_id"], "result": result}
         )
 
     async def mutate(request):
-        if authorization(request) is not None:
+        if await run_in_threadpool(authorization, request) is not None:
             raise PermissionError("SERVICE_AUTH_REQUIRED")
         data = await read_body(request)
+        return await run_in_threadpool(mutate_data, data)
+
+    def mutate_data(data):
         action = data["action"]
         if action == "link":
             result = store.link(
@@ -206,7 +215,7 @@ def install_routes(app, config, repository, objects):
         return JSONResponse(result)
 
     async def legacy_file(request):
-        claims = authorization(request)
+        claims = await run_in_threadpool(authorization, request)
         if claims is not None:
             raise PermissionError("SERVICE_AUTH_REQUIRED")
         data = await read_body(request)
@@ -216,7 +225,9 @@ def install_routes(app, config, repository, objects):
         importer = importlib.import_module("trackio.cloud_import").LegacyImporter(
             repository, objects
         )
-        content = importer.read_file(scope, data["source_id"], data["path"])
+        content = await run_in_threadpool(
+            importer.read_file, scope, data["source_id"], data["path"]
+        )
         return Response(
             content,
             media_type="application/octet-stream",
@@ -227,7 +238,7 @@ def install_routes(app, config, repository, objects):
             },
         )
 
-    async def download(request):
+    def download(request):
         claims = authorization(request)
         scope = effective_scope({"scope": dict(request.query_params)}, claims)
         payload = repository.read_object(

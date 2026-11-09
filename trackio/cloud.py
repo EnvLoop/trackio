@@ -11,6 +11,7 @@ import re
 import secrets
 import stat
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -34,12 +35,14 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.schema import CreateSchema
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from trackio import cloud_server
 from trackio.cloud_objects import MAX_OBJECT_BYTES
+from trackio.cloud_pools import current_workload, database_workload, validate_pool_sizes
 from trackio.cloud_records import RichRepository, rich_tables
 
 if sys.version_info >= (3, 11):
@@ -126,8 +129,11 @@ class CloudConfig:
     token_ttl: int = 3600
     database_schema: str | None = None
     objects_config_file: str | None = field(default=None, repr=False)
+    write_pool_size: int = 10
+    read_pool_size: int = 5
 
     def __post_init__(self):
+        validate_pool_sizes(self.write_pool_size, self.read_pool_size)
         if self.environment not in ("local", "staging", "prod"):
             raise ValueError("INVALID_ENVIRONMENT")
         if self.environment != "local" and not self.database_url.startswith(
@@ -170,6 +176,8 @@ class CloudConfig:
             signing_key=private_text(path.parent / raw["signing_key_file"]),
             token_ttl=raw.get("token_ttl", 3600),
             database_schema=raw.get("database_schema"),
+            write_pool_size=raw.get("write_pool_size", 10),
+            read_pool_size=raw.get("read_pool_size", 5),
             objects_config_file=str(path.parent / raw["objects_config_file"])
             if raw.get("objects_config_file")
             else None,
@@ -253,6 +261,8 @@ class MetricsRepository(RichRepository):
         schema=None,
         migrate_from=None,
         owner_role=None,
+        write_pool_size=10,
+        read_pool_size=5,
         _schema_extension=None,
         _schema_extension_ddl=False,
     ):
@@ -262,18 +272,40 @@ class MetricsRepository(RichRepository):
             raise ValueError("INVALID_SCHEMA_EXTENSION_DDL")
         if not url.startswith(("sqlite:///", "postgresql+psycopg://")):
             raise ValueError("UNSUPPORTED_DATABASE")
+        validate_pool_sizes(write_pool_size, read_pool_size)
         self.url = url
-        self.engine = create_engine(
-            url,
+        self.request_limits = (
+            {
+                "write": threading.BoundedSemaphore(write_pool_size),
+                "read": threading.BoundedSemaphore(read_pool_size),
+            }
+            if url.startswith("postgresql")
+            else {}
+        )
+        options = dict(
             pool_pre_ping=True,
             hide_parameters=True,
-            pool_size=3,
             max_overflow=0,
             pool_timeout=5,
             connect_args={"check_same_thread": False, "timeout": 30}
             if url.startswith("sqlite")
-            else {},
+            else {"options": "-c statement_timeout=5000 -c lock_timeout=1000"},
         )
+        self._engines = {}
+        try:
+            self._engines["write"] = create_engine(
+                url,
+                pool_size=3 if url.startswith("sqlite") else write_pool_size,
+                **options,
+            )
+            self._engines["read"] = (
+                self._engines["write"]
+                if url.startswith("sqlite")
+                else create_engine(url, pool_size=read_pool_size, **options)
+            )
+        except BaseException:
+            self.close()
+            raise
         if schema is not None:
             validate_schema(schema)
             if not url.startswith("postgresql+psycopg://"):
@@ -428,11 +460,16 @@ class MetricsRepository(RichRepository):
                 if _schema_extension is not None:
                     _schema_extension(self, connection)
         except BaseException:
-            self.engine.dispose()
+            self.close()
             raise
 
+    @property
+    def engine(self):
+        return self._engines[current_workload()]
+
     def close(self):
-        self.engine.dispose()
+        for engine in set(self._engines.values()):
+            engine.dispose()
 
     def capability(self, identity, trial_id, renew_until=None):
         now = time.time()
@@ -845,6 +882,8 @@ def create_app(config, repository=None, *, objects=None):
         initialize=config.environment == "local",
         initialize_workspace=config.environment == "local",
         schema=config.database_schema,
+        write_pool_size=config.write_pool_size,
+        read_pool_size=config.read_pool_size,
     )
 
     def service(request):
@@ -861,7 +900,7 @@ def create_app(config, repository=None, *, objects=None):
                 raise ValueError("REQUEST_TOO_LARGE")
         return json.loads(content)
 
-    async def ready(request):
+    def ready(request):
         with repository.engine.connect() as connection:
             connection.execute(select(repository.schema.c.version)).one()
             workspace_version = (
@@ -885,14 +924,18 @@ def create_app(config, repository=None, *, objects=None):
     async def bind_run(request):
         service(request)
         data = await body(request)
-        identity = repository.bind(
+        identity = await run_in_threadpool(
+            repository.bind,
             **{
                 key: data[key]
                 for key in ("workspace_id", "project_id", "job_id", "run_id", "config")
-            }
+            },
         )
-        capability = repository.capability(
-            identity, data.get("trial_id"), data.get("renew_until")
+        capability = await run_in_threadpool(
+            repository.capability,
+            identity,
+            data.get("trial_id"),
+            data.get("renew_until"),
         )
         return JSONResponse(tokens(capability))
 
@@ -942,7 +985,7 @@ def create_app(config, repository=None, *, objects=None):
             raise PermissionError("CAPABILITY_SCOPE_MISMATCH")
         return claims
 
-    async def refresh(request):
+    def refresh(request):
         raw = request.headers.get("authorization", "").removeprefix("Bearer ")
         capability_id = raw.partition(".")[0]
         if not hmac.compare_digest(raw, refresh_secret(capability_id)):
@@ -954,11 +997,11 @@ def create_app(config, repository=None, *, objects=None):
         identity = await body(request)
         if identity["run_id"] != request.path_params["run_id"]:
             raise PermissionError("RUN_SCOPE_MISMATCH")
-        repository.revoke(identity)
+        await run_in_threadpool(repository.revoke, identity)
         return JSONResponse({"revoked": True})
 
     async def append(request):
-        claims = authorized(request)
+        claims = await run_in_threadpool(authorized, request)
         if claims["run_id"] != request.path_params["run_id"]:
             return JSONResponse({"error": "RUN_SCOPE_MISMATCH"}, status_code=403)
         data = await body(request)
@@ -967,7 +1010,8 @@ def create_app(config, repository=None, *, objects=None):
             event.get("trial_id") != claims.get("trial_id") for event in data["events"]
         ):
             raise PermissionError("TRIAL_SCOPE_MISMATCH")
-        accepted = repository.append(
+        accepted = await run_in_threadpool(
+            repository.append,
             **{
                 key: claims[key]
                 for key in ("workspace_id", "project_id", "job_id", "run_id")
@@ -980,7 +1024,7 @@ def create_app(config, repository=None, *, objects=None):
             {"batch_id": data["batch_id"], "accepted": accepted, "committed": True}
         )
 
-    async def query(request):
+    def query(request):
         service(request)
         scope = {
             key: identifier(request.query_params[key])
@@ -996,14 +1040,14 @@ def create_app(config, repository=None, *, objects=None):
         return JSONResponse({"events": events[:2000], "truncated": len(events) > 2000})
 
     async def update_config(request):
-        claims = authorized(request)
+        claims = await run_in_threadpool(authorized, request)
         if claims["run_id"] != request.path_params["run_id"]:
             raise PermissionError("RUN_SCOPE_MISMATCH")
-        repository.update_config(claims, await body(request))
+        await run_in_threadpool(repository.update_config, claims, await body(request))
         return JSONResponse({"committed": True})
 
     async def upload_object(request):
-        claims = authorized(request)
+        claims = await run_in_threadpool(authorized, request)
         if claims["run_id"] != request.path_params["run_id"]:
             raise PermissionError("RUN_SCOPE_MISMATCH")
         payload = bytearray()
@@ -1011,7 +1055,8 @@ def create_app(config, repository=None, *, objects=None):
             payload.extend(chunk)
             if len(payload) > MAX_OBJECT_BYTES:
                 raise ValueError("OBJECT_TOO_LARGE")
-        repository.put_object(
+        await run_in_threadpool(
+            repository.put_object,
             claims,
             request.path_params["digest"],
             bytes(payload),
@@ -1023,11 +1068,11 @@ def create_app(config, repository=None, *, objects=None):
         )
 
     async def append_record(request):
-        claims = authorized(request)
+        claims = await run_in_threadpool(authorized, request)
         if claims["run_id"] != request.path_params["run_id"]:
             raise PermissionError("RUN_SCOPE_MISMATCH")
         record = await body(request)
-        accepted = repository.append_record(claims, record)
+        accepted = await run_in_threadpool(repository.append_record, claims, record)
         return JSONResponse(
             {"committed": True, "record_id": record["record_id"], "accepted": accepted}
         )
@@ -1039,7 +1084,7 @@ def create_app(config, repository=None, *, objects=None):
             for key in ("workspace_id", "project_id", "job_id", "run_id")
         }
 
-    async def query_records(request):
+    def query_records(request):
         rows = repository.read_records(
             read_scope(request),
             request.query_params.get("kind"),
@@ -1053,7 +1098,7 @@ def create_app(config, repository=None, *, objects=None):
             }
         )
 
-    async def download_object(request):
+    def download_object(request):
         scope = read_scope(request)
         if scope["run_id"] != request.path_params["run_id"]:
             raise PermissionError("RUN_SCOPE_MISMATCH")
@@ -1131,7 +1176,33 @@ def create_app(config, repository=None, *, objects=None):
     )
 
     async def no_cache(request, call_next):
-        response = await call_next(request)
+        from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+        workload = (
+            "read"
+            if request.method in {"GET", "HEAD"}
+            or request.url.path in {"/v1/workspace/query", "/v1/workspace/legacy-file"}
+            else "write"
+        )
+        limit = repository.request_limits.get(workload)
+        if limit is not None and not limit.acquire(blocking=False):
+            return JSONResponse(
+                {"error": "DATABASE_BUSY"},
+                status_code=503,
+                headers={"Retry-After": "1", "Cache-Control": "no-store"},
+            )
+        with database_workload(workload):
+            try:
+                response = await call_next(request)
+            except PoolTimeout:
+                response = JSONResponse(
+                    {"error": "DATABASE_BUSY"},
+                    status_code=503,
+                    headers={"Retry-After": "1"},
+                )
+            finally:
+                if limit is not None:
+                    limit.release()
         response.headers["Cache-Control"] = "no-store"
         return response
 
