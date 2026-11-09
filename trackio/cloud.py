@@ -1253,4 +1253,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    importlib.import_module("trackio.cloud").main()
