@@ -371,6 +371,7 @@ class MetricsRepository(RichRepository):
                 if url.startswith("postgresql+psycopg://") and (
                     initialize or migrate_from or _schema_extension_ddl
                 ):
+                    connection.execute(text("SET LOCAL statement_timeout = 60000"))
                     lock_id = int.from_bytes(
                         hashlib.sha256((schema or "public").encode()).digest()[:8],
                         "big",

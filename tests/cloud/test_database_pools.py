@@ -37,6 +37,44 @@ def test_postgres_reads_and_writes_use_fixed_independent_pools(postgres_database
         repository.close()
 
 
+def test_migration_timeout_is_local_and_runtime_connections_keep_short_budgets(
+    postgres_database,
+):
+    url, schema = postgres_database
+    observed = []
+
+    def observe(repository, connection):
+        observed.append(
+            connection.scalar(
+                text("SELECT setting FROM pg_settings WHERE name='statement_timeout'")
+            )
+        )
+
+    repository = MetricsRepository(url, schema=schema, _schema_extension=observe)
+    try:
+        assert observed == ["60000"]
+        for workload in ("write", "read"):
+            with database_workload(workload), repository.engine.connect() as connection:
+                assert (
+                    connection.scalar(
+                        text(
+                            "SELECT setting FROM pg_settings WHERE name='statement_timeout'"
+                        )
+                    )
+                    == "5000"
+                )
+                assert (
+                    connection.scalar(
+                        text(
+                            "SELECT setting FROM pg_settings WHERE name='lock_timeout'"
+                        )
+                    )
+                    == "1000"
+                )
+    finally:
+        repository.close()
+
+
 @pytest.mark.parametrize("size", [0, 4, 1001, True, "10"])
 def test_invalid_pool_sizes_fail_before_database_access(size):
     with pytest.raises(ValueError, match="DATABASE_POOL_SIZE"):
