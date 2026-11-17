@@ -44,6 +44,41 @@ it cannot list runs or query metrics. HTTP responses use `Cache-Control: no-stor
 An event batch is acknowledged only after its transaction commits. Identical
 replays are idempotent; conflicting event/batch identities fail atomically.
 
+## Selected scalar queries
+
+The service-only `GET /v1/metrics` accepts optional selection parameters. With no
+`category`, `metric`, `mode`, `max_points`, `limit` or `cursor`, it retains the
+legacy behavior and `events`/`truncated` response. Selected queries require `workspace_id`, `project_id`,
+`job_id`, `start`, `end` and `category=experiment|compute`. Optional `trial_id`
+narrows the trusted scope. Repeat `metric` for up to 32 exact metric names.
+Scope, time, category and metric existence are filtered in SQL before selecting
+events. Deleted workspace runs remain excluded.
+
+The default `mode=sample` accepts `max_points=2..2000` (default 500). It returns
+at most that many matching events, evenly spaced in chronological event order,
+including the first and last matching events. A requested metric consequently
+has no more than `max_points` observations. It does not average values or invent
+training steps. `sampled=true` and `truncated=true` disclose omitted events.
+Sparse metrics in a multi-metric sample may have fewer points; query one metric
+when its full curve is required. The database ranks the filtered history rather
+than transferring its complete payload to the caller.
+
+`mode=raw&limit=100` returns an unsampled page of matching events (`limit=1..500`).
+Send `next_cursor` back as `cursor` with the same scope, range, category, metric
+names and limit. A signed cursor binds those choices and the last chronological
+position, including run and event identity to distinguish tied timestamps.
+Changing or tampering with it fails. Pages are limited to 512 KiB of event JSON;
+a byte-limited page continues at its last returned event. An individual oversized
+event fails explicitly rather than disappearing. Chart sampling retains its
+first and last selected events when reducing for this byte limit.
+
+This is a chronological live read, not a snapshot export: observations backfilled
+before an already consumed cursor require a fresh read of that time range. The
+existing `/v1/metrics` contract remains available unchanged for legacy requests.
+`/ready` advertises `metric_query_v1`; consumers must verify this capability before
+sending selection parameters, since an older service can silently ignore them.
+There is no separate `/v1/metrics/query` endpoint.
+
 ## Managed SDK
 
 The controller supplies a private JSON context file through

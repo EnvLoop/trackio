@@ -41,6 +41,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from trackio import cloud_server
+from trackio.cloud_metrics import query_metrics, query_options
 from trackio.cloud_objects import MAX_OBJECT_BYTES
 from trackio.cloud_pools import validate_pool_sizes
 from trackio.cloud_records import RichRepository, rich_tables
@@ -922,7 +923,13 @@ def create_app(config, repository=None, *, objects=None):
                 "schema_version": SCHEMA_VERSION,
                 "api_version": 1,
                 "workspace_schema_version": workspace_version,
-                "capabilities": ["runs", "scalar_metrics", "system_metrics", "records"]
+                "capabilities": [
+                    "runs",
+                    "scalar_metrics",
+                    "system_metrics",
+                    "records",
+                    "metric_query_v1",
+                ]
                 + (["objects"] if objects is not None else []),
             }
         )
@@ -1036,6 +1043,24 @@ def create_app(config, repository=None, *, objects=None):
             key: identifier(request.query_params[key])
             for key in ("workspace_id", "project_id", "job_id")
         }
+        if set(request.query_params) & {
+            "category",
+            "metric",
+            "mode",
+            "max_points",
+            "limit",
+            "cursor",
+        }:
+            if "trial_id" in request.query_params:
+                scope["trial_id"] = identifier(request.query_params["trial_id"])
+            return JSONResponse(
+                query_metrics(
+                    repository,
+                    config.signing_key,
+                    scope,
+                    query_options(request.query_params),
+                )
+            )
         for key in ("start", "end"):
             if key in request.query_params:
                 scope[key] = float(request.query_params[key])
