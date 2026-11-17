@@ -41,6 +41,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from trackio import cloud_server
+from trackio.cloud_metrics import query_metrics, query_options
 from trackio.cloud_objects import MAX_OBJECT_BYTES
 from trackio.cloud_pools import validate_pool_sizes
 from trackio.cloud_records import RichRepository, rich_tables
@@ -922,7 +923,13 @@ def create_app(config, repository=None, *, objects=None):
                 "schema_version": SCHEMA_VERSION,
                 "api_version": 1,
                 "workspace_schema_version": workspace_version,
-                "capabilities": ["runs", "scalar_metrics", "system_metrics", "records"]
+                "capabilities": [
+                    "runs",
+                    "scalar_metrics",
+                    "system_metrics",
+                    "records",
+                    "metric_query_v1",
+                ]
                 + (["objects"] if objects is not None else []),
             }
         )
@@ -1045,6 +1052,19 @@ def create_app(config, repository=None, *, objects=None):
         events = repository.events(**scope)
         return JSONResponse({"events": events[:2000], "truncated": len(events) > 2000})
 
+    def selected_metrics(request):
+        service(request)
+        scope = {
+            key: identifier(request.query_params[key])
+            for key in ("workspace_id", "project_id", "job_id")
+        }
+        if "trial_id" in request.query_params:
+            scope["trial_id"] = identifier(request.query_params["trial_id"])
+        options = query_options(request.query_params)
+        return JSONResponse(
+            query_metrics(repository, config.signing_key, scope, options)
+        )
+
     async def update_config(request):
         claims = await run_in_threadpool(authorized, request)
         if claims["run_id"] != request.path_params["run_id"]:
@@ -1163,6 +1183,7 @@ def create_app(config, repository=None, *, objects=None):
             Route("/v1/runs", forbidden),
             Route("/v1/runs/{run_id}/events", append, methods=["POST"]),
             Route("/v1/metrics", query),
+            Route("/v1/metrics/query", selected_metrics),
             Route("/v1/runs/{run_id}/config", update_config, methods=["PUT"]),
             Route("/v1/capabilities/refresh", refresh, methods=["POST"]),
             Route("/v1/runs/{run_id}/revoke", revoke, methods=["POST"]),
