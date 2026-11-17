@@ -7,9 +7,14 @@ from trackio import cloud_metrics
 from trackio.cloud import CloudConfig, MetricsRepository, create_app
 
 
-@pytest.fixture
-def metrics(tmp_path):
-    repository = MetricsRepository(f"sqlite:///{tmp_path / 'metrics.sqlite'}")
+@pytest.fixture(params=["sqlite", "postgres"])
+def metrics(request, tmp_path):
+    database, schema = (
+        request.getfixturevalue("postgres_database")
+        if request.param == "postgres"
+        else (f"sqlite:///{tmp_path / 'metrics.sqlite'}", None)
+    )
+    repository = MetricsRepository(database, schema=schema)
     scope = dict(workspace_id="w", project_id="p", job_id="j", run_id="r")
     repository.bind(**scope, config={})
     for offset in range(0, 2300, 200):
@@ -33,7 +38,9 @@ def metrics(tmp_path):
                 ],
             },
         )
-    config = CloudConfig("local", repository.url, "s" * 32, "k" * 32)
+    config = CloudConfig(
+        "local", repository.url, "s" * 32, "k" * 32, database_schema=schema
+    )
     with TestClient(create_app(config, repository)) as client:
         yield client, repository
     repository.close()
@@ -51,7 +58,7 @@ def query(client, **updates):
     )
     parameters.update(updates)
     return client.get(
-        "/v1/metrics/query",
+        "/v1/metrics",
         params=parameters,
         headers={"Authorization": "Bearer " + "s" * 32},
     )
@@ -170,7 +177,7 @@ def test_query_scope_and_limits_cannot_be_bypassed(metrics):
     ):
         assert query(client, **options).status_code == 422
     response = client.get(
-        "/v1/metrics/query",
+        "/v1/metrics",
         params={
             "workspace_id": "other",
             "project_id": "p",
@@ -184,7 +191,24 @@ def test_query_scope_and_limits_cannot_be_bypassed(metrics):
     assert response.status_code == 200 and response.json()["events"] == []
     assert (
         client.get(
-            "/v1/metrics/query", headers={"Authorization": "Bearer worker-token"}
+            "/v1/metrics", headers={"Authorization": "Bearer worker-token"}
         ).status_code
         == 403
     )
+
+
+def test_legacy_query_is_unchanged_and_selected_query_uses_same_route(metrics):
+    client, _ = metrics
+    response = client.get(
+        "/v1/metrics",
+        params={"workspace_id": "w", "project_id": "p", "job_id": "j"},
+        headers={"Authorization": "Bearer " + "s" * 32},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"events", "truncated"}
+    assert len(body["events"]) == 2000 and body["truncated"]
+    assert body["events"][0]["step"] == 0 and body["events"][-1]["step"] == 1999
+    assert query(client, max_points=5).json()["events"][0]["step"] == 2200
+    assert client.get("/v1/metrics/query").status_code == 404
+    assert "metric_query_v1" in client.get("/ready").json()["capabilities"]

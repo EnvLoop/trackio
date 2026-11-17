@@ -46,7 +46,9 @@ replays are idempotent; conflicting event/batch identities fail atomically.
 
 ## Selected scalar queries
 
-The service-only `GET /v1/metrics/query` requires `workspace_id`, `project_id`,
+The service-only `GET /v1/metrics` accepts optional selection parameters. With no
+`category`, `metric`, `mode`, `max_points`, `limit` or `cursor`, it retains the
+legacy behavior and `events`/`truncated` response. Selected queries require `workspace_id`, `project_id`,
 `job_id`, `start`, `end` and `category=experiment|compute`. Optional `trial_id`
 narrows the trusted scope. Repeat `metric` for up to 32 exact metric names.
 Scope, time, category and metric existence are filtered in SQL before selecting
@@ -72,9 +74,10 @@ first and last selected events when reducing for this byte limit.
 
 This is a chronological live read, not a snapshot export: observations backfilled
 before an already consumed cursor require a fresh read of that time range. The
-existing `/v1/metrics` contract remains available unchanged. `/ready` advertises
-`metric_query_v1`; consumers must use the new endpoint to avoid silently ignored
-selection parameters on an older service.
+existing `/v1/metrics` contract remains available unchanged for legacy requests.
+`/ready` advertises `metric_query_v1`; consumers must verify this capability before
+sending selection parameters, since an older service can silently ignore them.
+There is no separate `/v1/metrics/query` endpoint.
 
 ## Managed SDK
 

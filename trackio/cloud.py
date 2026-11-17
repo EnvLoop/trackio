@@ -1043,6 +1043,24 @@ def create_app(config, repository=None, *, objects=None):
             key: identifier(request.query_params[key])
             for key in ("workspace_id", "project_id", "job_id")
         }
+        if set(request.query_params) & {
+            "category",
+            "metric",
+            "mode",
+            "max_points",
+            "limit",
+            "cursor",
+        }:
+            if "trial_id" in request.query_params:
+                scope["trial_id"] = identifier(request.query_params["trial_id"])
+            return JSONResponse(
+                query_metrics(
+                    repository,
+                    config.signing_key,
+                    scope,
+                    query_options(request.query_params),
+                )
+            )
         for key in ("start", "end"):
             if key in request.query_params:
                 scope[key] = float(request.query_params[key])
@@ -1051,19 +1069,6 @@ def create_app(config, repository=None, *, objects=None):
         scope["trial_id"] = request.query_params.get("trial_id")
         events = repository.events(**scope)
         return JSONResponse({"events": events[:2000], "truncated": len(events) > 2000})
-
-    def selected_metrics(request):
-        service(request)
-        scope = {
-            key: identifier(request.query_params[key])
-            for key in ("workspace_id", "project_id", "job_id")
-        }
-        if "trial_id" in request.query_params:
-            scope["trial_id"] = identifier(request.query_params["trial_id"])
-        options = query_options(request.query_params)
-        return JSONResponse(
-            query_metrics(repository, config.signing_key, scope, options)
-        )
 
     async def update_config(request):
         claims = await run_in_threadpool(authorized, request)
@@ -1183,7 +1188,6 @@ def create_app(config, repository=None, *, objects=None):
             Route("/v1/runs", forbidden),
             Route("/v1/runs/{run_id}/events", append, methods=["POST"]),
             Route("/v1/metrics", query),
-            Route("/v1/metrics/query", selected_metrics),
             Route("/v1/runs/{run_id}/config", update_config, methods=["PUT"]),
             Route("/v1/capabilities/refresh", refresh, methods=["POST"]),
             Route("/v1/runs/{run_id}/revoke", revoke, methods=["POST"]),
