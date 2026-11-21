@@ -87,7 +87,7 @@
   {#if scrollbarStyle}<svelte:element this={'style'} data-console-scrollbars>{scrollbarStyle}</svelte:element>{/if}
 </svelte:head>
 
-<main use:reportLayout>
+<main data-envloop-dashboard-view={page} use:reportLayout>
   <header>
     <strong>Trackio</strong>
     {#if !hostSelectsView}
