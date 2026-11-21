@@ -10,7 +10,9 @@
   let context = $state(null);
   let error = $state("");
   let loading = $state(true);
-  let page = $state("metrics");
+  const view = new URLSearchParams(window.location.hash.slice(1)).get("view");
+  const hostSelectsView = view === "metrics" || view === "system";
+  let page = $state(hostSelectsView ? view : "metrics");
   let xAxis = $state("step");
   let smoothing = $state(15);
   let selectedIds = $state([]);
@@ -85,13 +87,15 @@
   {#if scrollbarStyle}<svelte:element this={'style'} data-console-scrollbars>{scrollbarStyle}</svelte:element>{/if}
 </svelte:head>
 
-<main use:reportLayout>
+<main data-envloop-dashboard-view={page} use:reportLayout>
   <header>
     <strong>Trackio</strong>
-    <nav aria-label="Metric categories">
-      <button aria-pressed={page === "metrics"} onclick={() => page = "metrics"}>Metrics</button>
-      <button aria-pressed={page === "system"} onclick={() => page = "system"}>System metrics</button>
-    </nav>
+    {#if !hostSelectsView}
+      <nav aria-label="Metric categories">
+        <button aria-pressed={page === "metrics"} onclick={() => page = "metrics"}>Metrics</button>
+        <button aria-pressed={page === "system"} onclick={() => page = "system"}>System metrics</button>
+      </nav>
+    {/if}
     <button onclick={refresh} disabled={loading}>Refresh</button>
   </header>
   {#if !context && loading}
