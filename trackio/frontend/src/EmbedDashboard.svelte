@@ -2,6 +2,8 @@
   import { onMount, tick } from "svelte";
   import { callApi } from "./lib/api.js";
   import { applyTheme, detectSystemTheme, isDark } from "./lib/theme.js";
+  import { reportLayout } from "./lib/embedLayout.js";
+  import "./lib/embedCharts.css";
   import Metrics from "./pages/Metrics.svelte";
   import SystemMetrics from "./pages/SystemMetrics.svelte";
 
@@ -10,19 +12,24 @@
   let loading = $state(true);
   let page = $state("metrics");
   let xAxis = $state("step");
-  let smoothing = $state(0);
+  let smoothing = $state(15);
   let selectedIds = $state([]);
   let selectedRuns = $derived(context?.runs.filter(run => selectedIds.includes(run.id)) ?? []);
   let controller;
   let chart = $state(null);
+  let scrollbarStyle = $state("");
   let lastContextLoad = 0;
 
   function applyHostTheme(event) {
     if (event.source !== window.parent || event.origin !== window.location.origin) return;
     const message = event.data;
     if (message?.type !== "envloop.dashboard.theme") return;
+    if (typeof message.scrollbarStyle === "string") scrollbarStyle = message.scrollbarStyle;
     if (message.theme === "dark" && !isDark()) applyTheme("dark");
-    if (message.theme === "light" && isDark()) applyTheme("default");
+    if (message.theme === "light") {
+      if (isDark()) applyTheme("default");
+      document.documentElement.dataset.theme = "light";
+    }
   }
 
   async function refresh() {
@@ -74,7 +81,11 @@
 
 <svelte:window onmessage={applyHostTheme} />
 
-<main>
+<svelte:head>
+  {#if scrollbarStyle}<svelte:element this={'style'} data-console-scrollbars>{scrollbarStyle}</svelte:element>{/if}
+</svelte:head>
+
+<main use:reportLayout>
   <header>
     <strong>Trackio</strong>
     <nav aria-label="Metric categories">
@@ -123,6 +134,10 @@
 
 <style>
   :global(body) { margin: 0; background: var(--background-fill-primary); color: var(--body-text-color); font: 14px/1.5 system-ui, sans-serif; }
+  main { --color-accent: #3b82f6; accent-color: var(--color-accent); }
+  main :global(.custom-legend) { gap: 2px 8px; padding-top: 3px; }
+  main :global(.legend-item) { max-width: 100%; min-width: 0; }
+  main :global(.legend-label) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 32ch; }
   header, section, nav, section > label { display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }
   header, section { padding: .75rem 1rem; border-bottom: 1px solid var(--border-color-primary); }
   header > button { margin-left: auto; }

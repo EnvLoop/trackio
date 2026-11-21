@@ -148,12 +148,14 @@ export function getColorForIndex(i) {
   return _colorPalette[i % _colorPalette.length];
 }
 
-export function buildColorMap(runs) {
+const EMBED_COLORS = ["#3B82F6", ...DEFAULT_COLORS.filter(color => color !== "#3B82F6")];
+
+export function buildColorMap(runs, {embedded = false} = {}) {
   const map = {};
   runs.forEach((run, i) => {
     const key =
       typeof run === "string" ? run : (run?.id ?? run?.name ?? String(i));
-    map[key] = getColorForIndex(runs.length - 1 - i);
+    map[key] = embedded ? EMBED_COLORS[i % EMBED_COLORS.length] : getColorForIndex(runs.length - 1 - i);
   });
   return map;
 }

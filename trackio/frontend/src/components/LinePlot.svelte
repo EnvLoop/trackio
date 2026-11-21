@@ -708,7 +708,7 @@
         {#each visibleLegend as entry}
           <span class="legend-item">
             <span class="legend-dot" style="background: {entry.color}"></span>
-            <span class="legend-label">{entry.name}</span>
+            <span class="legend-label" title={entry.name}>{entry.name}</span>
           </span>
         {/each}
         {#if legendEntries.length > LEGEND_COLLAPSED_COUNT}
@@ -741,7 +741,7 @@
                 stroke-linecap="round"
               />
             </svg>
-            <span class="legend-label">{entry.name}</span>
+            <span class="legend-label" title={entry.name}>{entry.name}</span>
           </span>
         {/each}
       </div>
@@ -823,7 +823,7 @@
         {#each visibleLegendFs as entry}
           <span class="legend-item">
             <span class="legend-dot" style="background: {entry.color}"></span>
-            <span class="legend-label">{entry.name}</span>
+            <span class="legend-label" title={entry.name}>{entry.name}</span>
           </span>
         {/each}
         {#if legendEntries.length > LEGEND_COLLAPSED_COUNT}
@@ -856,7 +856,7 @@
                 stroke-linecap="round"
               />
             </svg>
-            <span class="legend-label">{entry.name}</span>
+            <span class="legend-label" title={entry.name}>{entry.name}</span>
           </span>
         {/each}
       </div>
