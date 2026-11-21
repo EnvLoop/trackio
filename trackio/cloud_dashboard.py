@@ -239,7 +239,7 @@ def _batch(connection, statement, records, payload, series_columns, selected, ca
         .limit(MAX_LOGS + 1)
     )
     size = _size({"data": entries})
-    with connection.execution_options(yield_per=1).execute(query) as rows:
+    with connection.execution_options(yield_per=128).execute(query) as rows:
         for index, (run_id, raw) in enumerate(rows):
             event = json.loads(raw)
             row = log_row(event)

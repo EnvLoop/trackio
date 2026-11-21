@@ -7,7 +7,7 @@ A platform can embed Trackio’s Metrics and System metrics pages for an authori
 1. Authenticate the browser and resolve the requested Job or Trial to its permitted cloud scopes on the platform.
 2. Fetch `GET /v1/dashboard/assets/index.html` using the platform service bearer. Prefix the HTML’s `/assets/` references with the resource’s content path. Set `window.__trackio_base` to that path and `window.__trackio_embed = true` before the module loads. Forward packaged JS and CSS using the same service bearer.
 3. For each browser `POST <content path>/api/<action>`, reauthorize the resource. Forward its params to `POST /v1/dashboard/query` with the authorized scopes, action and service bearer. The browser receives the native response and uses its platform session.
-4. Serve HTML and assets under the platform’s resource authorization and frame policy. The native plots use Vega’s expression interpreter when embedded. A nonce can authorize the platform’s inline configuration script. External scripts and evaluation of JavaScript expressions through CSP’s `unsafe-eval` are unnecessary.
+4. Serve HTML and assets under the platform’s resource authorization and frame policy. The native plots use Vega’s expression interpreter when embedded. A nonce can authorize the platform’s inline configuration script. The same-origin parent can send `{type: "envloop.dashboard.theme", theme: "dark"}` or its `"light"` counterpart to the iframe on load and whenever the host theme changes. The Dashboard applies the host theme to its controls and plots.
 
 ## Query contract
 

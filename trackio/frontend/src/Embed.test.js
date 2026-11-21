@@ -146,3 +146,55 @@ it("leaves terminal resources on manual refresh", async () => {
     vi.useRealTimers();
   }
 });
+
+it.each(["Metrics", "System metrics"])("refreshes backfilled bounded history in %s", async category => {
+  vi.stubGlobal("__trackio_live", false);
+  vi.stubGlobal("IntersectionObserver", class { observe() {} disconnect() {} });
+  vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+  let backfilled = false;
+  let batches = 0;
+  setup(url => {
+    if (url.endsWith("/get_embed_context")) {
+      return Response.json({ data: {
+        project: "project", readonly: true, runs: [{ id: "a", name: "writer" }]
+      } });
+    }
+    batches++;
+    const early = backfilled
+      ? { step: 2, timestamp: "2026-01-01T12:00:02Z", delayed: 2 }
+      : { step: 1, timestamp: "2026-01-01T12:00:01Z", evicted: 1 };
+    return Response.json({ data: [{ run_id: "a", truncated: true, logs: [
+      early, { step: 3, timestamp: "2026-01-01T12:00:03Z", latest: 3 },
+    ] }] });
+  });
+  await render();
+  if (category === "System metrics") {
+    [...target.querySelectorAll("button")].find(button => button.textContent === category).click();
+  }
+  await vi.waitFor(() => expect(target.querySelector('[data-metric="evicted"]')).toBeTruthy());
+  const before = batches;
+  backfilled = true;
+  [...target.querySelectorAll("button")].find(button => button.textContent === "Refresh").click();
+  await vi.waitFor(() => expect(batches).toBeGreaterThan(before));
+  await vi.waitFor(() => expect(target.querySelector('[data-metric="delayed"]')).toBeTruthy());
+  expect(target.querySelector('[data-metric="evicted"]')).toBeNull();
+});
+
+it("accepts theme changes only from the same-origin parent", async () => {
+  setup(() => Response.json({ data: { project: "project", readonly: true, runs: [] } }));
+  await render();
+  const send = (theme, origin = location.origin, source = window.parent) => {
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { type: "envloop.dashboard.theme", theme }, origin, source
+    }));
+  };
+  send("dark", "https://unrelated.invalid");
+  send("dark", location.origin, null);
+  expect(document.documentElement.dataset.theme).not.toBe("dark");
+  send("dark");
+  expect(document.documentElement.dataset.theme).toBe("dark");
+  send("invalid");
+  expect(document.documentElement.dataset.theme).toBe("dark");
+  send("light");
+  expect(document.documentElement.dataset.theme).not.toBe("dark");
+});

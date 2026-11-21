@@ -217,3 +217,49 @@ def test_observation_timestamp_retains_submicrosecond_precision():
         {"metrics": {}, "step": 0, "observed_at": 12.123456789}
     )
     assert row["timestamp"] == "1970-01-01T00:00:12.123456789+00:00"
+
+
+def test_postgres_streams_bounded_history_in_chunks(postgres_database, monkeypatch):
+    from psycopg import ServerCursor
+
+    database, schema = postgres_database
+    repo = MetricsRepository(database, schema=schema)
+    try:
+        repo.bind(**SCOPE, config={})
+        for offset in range(0, 5000, 200):
+            repo.append(
+                **SCOPE,
+                batch={
+                    "batch_id": str(offset),
+                    "events": [
+                        dict(
+                            event_id=str(step),
+                            step=step,
+                            writer_id="writer",
+                            trial_id="trial",
+                            observed_at=step,
+                            category="experiment",
+                            metrics={"value": step},
+                        )
+                        for step in range(offset, offset + 200)
+                    ],
+                },
+            )
+        scopes = [{**WINDOW, "start": 0, "end": 5000}]
+        request = {"action": "get_embed_context", "params": {}, "scopes": scopes}
+        runs = cloud_dashboard.query(repo, request)["data"]["runs"]
+        request.update(action="get_logs_batch", params=native_params(runs))
+        sizes = []
+        fetchmany = ServerCursor.fetchmany
+
+        def count_fetch(cursor, size=0):
+            sizes.append(size)
+            return fetchmany(cursor, size)
+
+        monkeypatch.setattr(ServerCursor, "fetchmany", count_fetch)
+        (entry,) = cloud_dashboard.query(repo, request)["data"]
+        assert len(entry["logs"]) == 5000 and not entry["truncated"]
+        assert 1 < len(sizes) <= 100, (len(sizes), set(sizes))
+        assert max(sizes) <= 256
+    finally:
+        repo.close()

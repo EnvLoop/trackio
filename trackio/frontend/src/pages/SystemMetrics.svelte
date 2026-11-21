@@ -309,7 +309,7 @@
           const runKey = entry.run_id ?? entry.run;
           const logs = entry.logs;
           const prev = rawDataCache.get(runKey);
-          if (!prev || prev.truncated !== entry.truncated || logsHaveNewData(prev.logs, logs)) {
+          if (embedded || !prev || prev.truncated !== entry.truncated || logsHaveNewData(prev.logs, logs)) {
             rawDataCache.set(runKey, entry);
             changed = true;
           }

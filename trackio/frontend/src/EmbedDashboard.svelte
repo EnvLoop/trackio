@@ -1,7 +1,7 @@
 <script>
   import { onMount, tick } from "svelte";
   import { callApi } from "./lib/api.js";
-  import { applyTheme, detectSystemTheme } from "./lib/theme.js";
+  import { applyTheme, detectSystemTheme, isDark } from "./lib/theme.js";
   import Metrics from "./pages/Metrics.svelte";
   import SystemMetrics from "./pages/SystemMetrics.svelte";
 
@@ -16,6 +16,14 @@
   let controller;
   let chart = $state(null);
   let lastContextLoad = 0;
+
+  function applyHostTheme(event) {
+    if (event.source !== window.parent || event.origin !== window.location.origin) return;
+    const message = event.data;
+    if (message?.type !== "envloop.dashboard.theme") return;
+    if (message.theme === "dark" && !isDark()) applyTheme("dark");
+    if (message.theme === "light" && isDark()) applyTheme("default");
+  }
 
   async function refresh() {
     controller?.abort();
@@ -63,6 +71,8 @@
     };
   });
 </script>
+
+<svelte:window onmessage={applyHostTheme} />
 
 <main>
   <header>
