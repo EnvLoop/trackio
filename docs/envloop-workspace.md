@@ -126,11 +126,11 @@ catalog commit. Resources reference only committed same-run objects.
 Scalar retries retain their original batch/event IDs. Workspace retries retain
 their operation ID and content digest; a changed request under an existing ID
 is rejected. Local files are removed only after the corresponding committed ACK.
-The managed `finish(timeout=...)` stops monitors and bounds delivery waiting; it
-writes local delivery status, retaining pending data on timeout/full spool.
-It does not guarantee a fixed number of HTTP requests or database batches, and
-does not synthesize a Job, Trial or training step. Native callbacks may update
-config or emit their own terminal metrics before finish.
+The managed `finish(timeout=...)` stops monitors and bounds delivery waiting.
+It writes local delivery status and retains pending data. A later finish or a
+reopen with the same private run context can complete delivery. Native callbacks
+may update config or emit their own terminal metrics before finish. See the
+[managed SDK delivery contract](envloop-cloud-metrics.md#managed-sdk).
 
 E2E should assert the required event IDs/metric values and original step/Trial
 identity exactly once, selected config readback, operation/resource digests,

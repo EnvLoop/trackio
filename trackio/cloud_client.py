@@ -3,11 +3,14 @@
 import json
 import math
 import os
+import re
 import stat
 import threading
 import time
 import uuid
 import warnings
+from collections import deque
+from itertools import islice
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -18,6 +21,12 @@ import trackio.cpu as cpu_metrics
 import trackio.gpu as gpu_metrics
 from trackio.cloud_artifacts import WorkspaceRunMixin
 from trackio.cloud_rich_client import CloudSummary, RichCloudRun
+
+MAX_BATCH_EVENTS = 256
+MAX_BATCH_BYTES = 1024 * 1024
+BATCH_JOURNAL_RESERVE = 16 * 1024
+DELIVERY_STATUS_RESERVE = 192
+EVENT_FILE_NAME = re.compile(r"[0-9]+-[0-9a-f]{32}\.json")
 
 CONFIG_FIELDS = frozenset(
     {
@@ -74,6 +83,8 @@ class CloudConfig(dict):
             return
         try:
             with self.run.lock:
+                if self.run.closed:
+                    return
                 super().update(selected)
                 self.run._write(
                     self.run.directory / "config.pending", self.selected(self)
@@ -124,13 +135,12 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
             or stat.S_IMODE(metadata.st_mode) != 0o700
         ):
             raise ValueError("PRIVATE_SPOOL_DIRECTORY_REQUIRED")
-        self.transport = transport or httpx2.Client(
-            timeout=10, follow_redirects=False, trust_env=False
-        )
+        self.transport = transport if transport is not None else self._new_transport()
         self.owns_transport = transport is None
         self.lock = threading.RLock()
         self.flush_lock = threading.Lock()
         self.config = CloudConfig(self)
+        self.event_batch_path = self.directory / "event-batch.pending"
         self.state_path = self.directory / "state"
         if self.state_path.exists():
             self.state = json.loads(self.state_path.read_text())
@@ -145,12 +155,25 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
             }
             self._write(self.state_path, self.state)
 
+    @staticmethod
+    def _new_transport():
+        return httpx2.Client(timeout=10, follow_redirects=False, trust_env=False)
+
+    def _sync_directory(self):
+        descriptor = os.open(self.directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     def _write(self, path, payload):
         encoded = json.dumps(payload, allow_nan=False, separators=(",", ":"))
         previous_size = path.stat().st_size if path.exists() else 0
         limit = self.max_bytes
-        if path.name not in {"state", "delivery-status"}:
-            limit -= min(512, self.max_bytes // 4)
+        if path == self.event_batch_path:
+            limit -= min(DELIVERY_STATUS_RESERVE, self.max_bytes // 4)
+        elif path.name not in {"state", "delivery-status"}:
+            limit -= min(BATCH_JOURNAL_RESERVE, self.max_bytes // 4)
         if self._spool_size() - previous_size + len(encoded.encode()) > limit:
             raise BufferError("METRICS_SPOOL_FULL")
         temporary = path.with_suffix("." + uuid.uuid4().hex + ".tmp")
@@ -161,11 +184,7 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
-            descriptor = os.open(self.directory, os.O_RDONLY)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+            self._sync_directory()
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -245,46 +264,187 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
         raise OSError("METRICS_SPOOL_UNAVAILABLE")
 
     def flush(self):
+        self._flush()
+
+    def _flush(self, stopped=None):
+        def cancelled():
+            return stopped is not None and stopped.is_set()
+
         with self.flush_lock:
             config_path = self.directory / "config.pending"
             with self.lock:
+                if cancelled():
+                    return
                 self._collect_spool_objects()
                 config = config_path.read_bytes() if config_path.exists() else None
-                paths = sorted(self.directory.glob("*.json"))
             if config is not None:
                 response = self._request(
-                    "put",
-                    self.endpoint + "/config",
-                    json=json.loads(config),
+                    "put", self.endpoint + "/config", json=json.loads(config)
                 )
-                response.raise_for_status()
-                if response.json().get("committed") is not True:
-                    raise RuntimeError("INVALID_COMMIT_ACK")
+                self._check_ack(response)
                 with self.lock:
+                    if cancelled():
+                        return
                     if config_path.exists() and config_path.read_bytes() == config:
                         config_path.unlink()
-            for path in paths:
-                payload = json.loads(path.read_text())
+
+            with self.lock:
+                if cancelled():
+                    return
+                journal = self._read_batch_journal()
+                if journal is not None:
+                    events = (
+                        None
+                        if journal["acknowledged"]
+                        else self._read_batch_events(journal)
+                    )
+            if journal is not None:
+                self._flush_event_batch(journal, events, cancelled)
+
+            with self.lock:
+                if cancelled():
+                    return
+                paths = deque(sorted(self.directory.glob("*.json")))
+            while paths:
+                with self.lock:
+                    if cancelled():
+                        return
+                    path = paths.popleft()
+                    payload = json.loads(path.read_text())
+                    if "record" not in payload:
+                        journal, events = self._prepare_event_batch(
+                            path, payload, paths
+                        )
                 if "record" in payload:
                     self._flush_record(payload)
                     with self.lock:
+                        if cancelled():
+                            return
                         path.unlink(missing_ok=True)
                         self._collect_spool_objects()
-                    continue
-                response = self._request(
-                    "post",
-                    self.endpoint + "/events",
-                    json=payload,
-                )
-                response.raise_for_status()
-                ack = response.json()
-                if (
-                    not ack.get("committed")
-                    or ack.get("batch_id") != payload["batch_id"]
-                ):
-                    raise RuntimeError("INVALID_COMMIT_ACK")
-                with self.lock:
-                    path.unlink(missing_ok=True)
+                else:
+                    self._flush_event_batch(journal, events, cancelled)
+
+    @staticmethod
+    def _event_bytes(events):
+        def normalized(value):
+            return int(value) if type(value) is float and value.is_integer() else value
+
+        size = 0
+        for event in events:
+            canonical_event = {
+                **event,
+                "observed_at": normalized(event["observed_at"]),
+                "metrics": {
+                    key: normalized(value) for key, value in event["metrics"].items()
+                },
+            }
+            size += 1 + max(
+                len(json.dumps(event, separators=(",", ":"))),
+                len(json.dumps(canonical_event, separators=(",", ":"))),
+            )
+        return size
+
+    def _prepare_event_batch(self, path, payload, paths):
+        first_events = payload["events"]
+        events = list(first_events)
+        batch_paths = [path.name]
+        batch_id = "sdk-" + uuid.uuid4().hex
+        size = (
+            len(batch_id)
+            + len('{"batch_id":"","events":[]}')
+            + self._event_bytes(events)
+        )
+        for next_path in islice(paths, MAX_BATCH_EVENTS - 1):
+            next_payload = json.loads(next_path.read_text())
+            if "record" in next_payload:
+                break
+            next_events = next_payload["events"]
+            next_size = size + self._event_bytes(next_events)
+            if (
+                len(events) + len(next_events) > MAX_BATCH_EVENTS
+                or next_size > MAX_BATCH_BYTES
+            ):
+                break
+            size = next_size
+            batch_paths.append(next_path.name)
+            events.extend(next_events)
+
+        journal = {"batch_id": batch_id, "paths": batch_paths, "acknowledged": False}
+        if len(batch_paths) > 1:
+            try:
+                self._write(self.event_batch_path, journal)
+            except BufferError:
+                batch_paths = [path.name]
+            else:
+                for _ in range(len(batch_paths) - 1):
+                    paths.popleft()
+                return journal, events
+
+        journal.update(batch_id=payload["batch_id"], paths=batch_paths)
+        self._write(self.event_batch_path, journal)
+        return journal, first_events
+
+    def _read_batch_journal(self):
+        if not self.event_batch_path.exists():
+            return None
+        journal = json.loads(self.event_batch_path.read_text())
+        if (
+            not isinstance(journal, dict)
+            or not isinstance(journal.get("batch_id"), str)
+            or not isinstance(journal.get("paths"), list)
+            or not 1 <= len(journal["paths"]) <= MAX_BATCH_EVENTS
+            or any(
+                not isinstance(name, str) or not EVENT_FILE_NAME.fullmatch(name)
+                for name in journal["paths"]
+            )
+            or type(journal.get("acknowledged")) is not bool
+        ):
+            raise ValueError("INVALID_BATCH_JOURNAL")
+        return journal
+
+    def _read_batch_events(self, journal):
+        return [
+            event
+            for name in journal["paths"]
+            for event in json.loads((self.directory / name).read_text())["events"]
+        ]
+
+    @staticmethod
+    def _check_ack(response, key=None, identity=None):
+        response.raise_for_status()
+        try:
+            ack = response.json()
+        except ValueError:
+            raise RuntimeError("INVALID_COMMIT_ACK") from None
+        if (
+            not isinstance(ack, dict)
+            or ack.get("committed") is not True
+            or (key is not None and ack.get(key) != identity)
+        ):
+            raise RuntimeError("INVALID_COMMIT_ACK")
+
+    def _flush_event_batch(self, journal, events, cancelled):
+        if cancelled():
+            return
+        if events is not None:
+            batch_id = journal["batch_id"]
+            response = self._request(
+                "post",
+                self.endpoint + "/events",
+                json={"batch_id": batch_id, "events": events},
+            )
+            self._check_ack(response, "batch_id", batch_id)
+        with self.lock:
+            if cancelled():
+                return
+            if events is not None:
+                self._write(self.event_batch_path, {**journal, "acknowledged": True})
+            for name in journal["paths"]:
+                (self.directory / name).unlink(missing_ok=True)
+            self._sync_directory()
+            self.event_batch_path.unlink()
+            self._sync_directory()
 
     def _request(self, method, endpoint, **kwargs):
         send = getattr(self.transport, method)
@@ -335,17 +495,26 @@ class ManagedCloudRun(CloudRun):
         super().__init__(*args, **kwargs)
         self.wake = threading.Event()
         self.stopped = threading.Event()
+        self.progress = threading.Condition(self.lock)
+        self._finishers = 0
+        self._worker_retired = False
+        self._last_error = None
         self.delivery_status = {"committed": False, "pending": 0, "dropped": 0}
         self.monitors = []
         self.system_started = False
         self.closed = False
         previous = self.directory / "delivery-status"
         if previous.exists():
-            self.delivery_status["dropped"] = json.loads(previous.read_text())[
-                "dropped"
-            ]
+            dropped = json.loads(previous.read_text())["dropped"]
+            if type(dropped) is not int or dropped < 0:
+                raise ValueError("INVALID_DELIVERY_RECEIPT")
+            self.delivery_status["dropped"] = dropped
+        self._start_worker()
+
+    def _start_worker(self):
         self.worker = threading.Thread(target=self._pump, daemon=True)
         self.worker.start()
+        self.wake.set()
 
     def start_system(
         self,
@@ -395,18 +564,59 @@ class ManagedCloudRun(CloudRun):
         self.wake.set()
 
     def _pump(self):
-        try:
-            while not self.stopped.is_set():
-                self.wake.wait(1)
-                self.wake.clear()
-                try:
-                    self.flush()
-                except (OSError, httpx2.HTTPError, RuntimeError, ValueError):
-                    self.delivery_status["committed"] = False
-                    self.stopped.wait(1)
-        finally:
-            if self.owns_transport:
-                self.transport.close()
+        while True:
+            self.wake.wait(1)
+            self.wake.clear()
+            with self.progress:
+                if self.stopped.is_set():
+                    self._worker_retired = True
+                    transport = self.transport
+                    break
+            category = None
+            try:
+                self._flush(self.stopped)
+            except (
+                httpx2.HTTPError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+            ) as error:
+                category = self._error_category(error)
+            with self.progress:
+                if not self.stopped.is_set():
+                    self._last_error = category
+                self.progress.notify_all()
+            if category:
+                self.stopped.wait(1)
+        if self.owns_transport:
+            transport.close()
+
+    @staticmethod
+    def _error_category(error):
+        if isinstance(error, httpx2.HTTPStatusError):
+            status = error.response.status_code
+            if status in (401, 403):
+                return "permission"
+            if status >= 500 or status in (408, 429):
+                return "transport"
+            return "rejected"
+        if isinstance(error, httpx2.HTTPError):
+            return "transport"
+        if str(error) == "INVALID_REFRESH_SCOPE":
+            return "permission"
+        if str(error) in (
+            "INVALID_COMMIT_ACK",
+            "INVALID_RECORD_ACK",
+            "INVALID_OBJECT_ACK",
+        ):
+            return "invalid_ack"
+        return "spool"
+
+    def log(self, metrics, step=None):
+        with self.lock:
+            if not self.closed:
+                super().log(metrics, step)
 
     def _log(self, *args):
         try:
@@ -423,7 +633,8 @@ class ManagedCloudRun(CloudRun):
             self._record_gap()
 
     def _record_gap(self):
-        self.delivery_status["dropped"] += 1
+        with self.lock:
+            self.delivery_status["dropped"] += 1
         warnings.warn(
             "TRACKIO_METRICS_GAP: metrics could not be durably buffered",
             RuntimeWarning,
@@ -438,43 +649,71 @@ class ManagedCloudRun(CloudRun):
         ):
             raise ValueError("INVALID_FINISH_TIMEOUT")
         deadline = time.monotonic() + timeout
-        with self.lock:
+        with self.progress:
             self.closed = True
-        for monitor in self.monitors:
-            try:
-                monitor.stop(timeout=max(0, min(2, deadline - time.monotonic())))
-            except Exception:
-                self._record_gap()
-        self.monitors.clear()
-        self.wake.set()
-        while time.monotonic() < deadline:
-            pending = len(list(self.directory.glob("*.json"))) + int(
-                (self.directory / "config.pending").exists()
-            )
-            if not pending:
-                break
-            self.stopped.wait(0.05)
-        self.stopped.set()
-        self.worker.join(timeout=max(0, min(0.1, deadline - time.monotonic())))
-        pending = len(list(self.directory.glob("*.json"))) + int(
-            (self.directory / "config.pending").exists()
-        )
-        self.delivery_status.update(
-            committed=pending == 0 and self.delivery_status["dropped"] == 0,
-            pending=pending,
-        )
+            monitors, self.monitors = self.monitors, []
+            self._finishers += 1
+            if timeout > 0 and self._pending_count():
+                self.stopped.clear()
+                if self._worker_retired:
+                    if self.owns_transport:
+                        self.transport = self._new_transport()
+                    self._worker_retired = False
+                    self._start_worker()
+                else:
+                    self.wake.set()
         try:
-            self._write(self.directory / "delivery-status", self.delivery_status)
-        except (OSError, BufferError):
-            self._record_gap()
-            self.delivery_status["committed"] = False
-        if not self.delivery_status["committed"]:
+            for monitor in monitors:
+                try:
+                    monitor.stop(timeout=max(0, min(2, deadline - time.monotonic())))
+                except Exception:
+                    self._record_gap()
+            with self.progress:
+                while self._pending_count():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self.progress.wait(min(remaining, 0.05))
+        finally:
+            with self.progress:
+                self._finishers -= 1
+                if not self._finishers:
+                    self.stopped.set()
+                    self.wake.set()
+                status = self._delivery_receipt()
+        if status["pending"]:
             warnings.warn(
                 "TRACKIO_METRICS_DELAYED: pending metrics remain in the private spool",
                 RuntimeWarning,
                 stacklevel=2,
             )
-        return dict(self.delivery_status)
+        return status
+
+    def _pending_count(self):
+        pending = len(list(self.directory.glob("*.json")))
+        if not pending and self.event_batch_path.exists():
+            pending = 1
+        return pending + int((self.directory / "config.pending").exists())
+
+    def _delivery_receipt(self):
+        pending = self._pending_count()
+        dropped = self.delivery_status["dropped"]
+        status = {
+            "committed": not pending and not dropped,
+            "pending": pending,
+            "dropped": dropped,
+        }
+        if pending:
+            status["error_category"] = self._last_error or "timeout"
+        elif dropped:
+            status["error_category"] = "dropped"
+        try:
+            self._write(self.directory / "delivery-status", status)
+        except (OSError, BufferError):
+            self._record_gap()
+            status.update(committed=False, dropped=dropped + 1, error_category="spool")
+        self.delivery_status = status
+        return dict(status)
 
 
 def init_from_context(path, *, config=None, system=None):

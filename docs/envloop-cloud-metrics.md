@@ -6,6 +6,8 @@ runs, scalar metrics, system metrics and filtered configuration only. Media,
 artifacts, registry, traces, alerts, exports and project mutation are not supported
 by the cloud service. The original local Trackio path remains available when no
 managed context is supplied. Cloud mode never falls back to that SQLite path.
+The [managed dashboard](envloop-cloud-dashboard.md) describes the read-only
+native interface for platform integrations.
 
 ## Service and schema
 
@@ -99,11 +101,33 @@ trackio.finish()
 Only finite scalars are accepted. Explicit `step` or `train/global_step` preserves
 the actual training step; missing steps remain unknown. Configuration fields are
 allowlisted; arbitrary credentials and training arguments are not uploaded.
-Reports use a bounded private file spool, asynchronous delivery and durable ACKs.
-Reopening the same run/Trial spool preserves its writer and pending event IDs.
-`finish` has a bounded flush deadline and writes `delivery-status`; pending data
-is retained and a metrics-gap warning does not establish training failure.
-Each spool is for one reporting process. Distributed writers need separate spools.
+The SDK writes events to a bounded private spool and sends adjacent scalar events
+in asynchronous batches of up to 256 events and 1 MiB. It preserves each event's
+identity, groups retries under the original batch ID, and checkpoints the matching
+commit ACK before removing spool files. Rich records retain their queue order.
+
+`run.finish(timeout=...)` stops managed sampling and waits up to the delivery
+deadline. Its returned status is also written to `delivery-status` in the spool.
+`pending` counts queued records and config still awaiting delivery or cleanup.
+`dropped` counts gaps recorded by the SDK. `committed` is true when both counts
+are zero and the receipt was saved. An incomplete status also includes a safe
+`error_category` such as `timeout`, `transport`, `permission`, `rejected`,
+`invalid_ack`, `spool` or `dropped`.
+
+To resume a pending delivery, call `run.finish(timeout=...)` again. Once the
+reporting process has exited, the controller can also reopen the same spool
+using the original private run/Trial context and deliver with system sampling off.
+
+```python
+from trackio.cloud_client import init_from_context
+
+run = init_from_context(
+    context_path, system={"auto_log_cpu": False, "auto_log_gpu": False}
+)
+status = run.finish(timeout=5)
+```
+
+Each spool has one reporting process. Distributed writers use separate spools.
 
 ## Tests and current limits
 
