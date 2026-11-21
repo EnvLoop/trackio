@@ -54,6 +54,7 @@ it("renders native experiment and compute pages with scoped query feedback", asy
   await render();
   await vi.waitFor(() => expect(target.querySelector(".metrics-page")).toBeTruthy());
   await vi.waitFor(() => expect(target.textContent).toContain("truncated"));
+  expect(target.querySelector('input[type="range"]').value).toBe("15");
   expect(target.textContent).toContain("Trial / writer");
   expect(target.textContent).not.toContain("trackio.init");
   [...target.querySelectorAll("button")].find(button => button.textContent.includes("System metrics")).click();
@@ -185,16 +186,63 @@ it("accepts theme changes only from the same-origin parent", async () => {
   await render();
   const send = (theme, origin = location.origin, source = window.parent) => {
     window.dispatchEvent(new MessageEvent("message", {
-      data: { type: "envloop.dashboard.theme", theme }, origin, source
+      data: { type: "envloop.dashboard.theme", theme, scrollbarStyle: "/* " + theme + " */" }, origin, source
     }));
   };
   send("dark", "https://unrelated.invalid");
   send("dark", location.origin, null);
   expect(document.documentElement.dataset.theme).not.toBe("dark");
+  expect(document.querySelector("style[data-console-scrollbars]")).toBeNull();
   send("dark");
   expect(document.documentElement.dataset.theme).toBe("dark");
   send("invalid");
   expect(document.documentElement.dataset.theme).toBe("dark");
   send("light");
+  await vi.waitFor(() => expect(document.querySelector("style[data-console-scrollbars]")?.textContent).toBe("/* light */"));
+  expect(document.querySelectorAll("style[data-console-scrollbars]")).toHaveLength(1);
+  expect(document.querySelector("style[data-console-scrollbars]").textContent).toBe("/* light */");
   expect(document.documentElement.dataset.theme).not.toBe("dark");
+});
+
+it("uses blue for the first embedded series and distinct colors for later series", async () => {
+  const {buildColorMap} = await import("./lib/stores.js");
+  const colors = buildColorMap(["first", "next"], {embedded: true});
+  expect(colors.first).toBe("#3B82F6");
+  expect(new Set(Object.values(colors)).size).toBe(2);
+  expect(buildColorMap(["only"]).only).toBe("#A8769B");
+});
+
+it("measures the lower edge of the second visible chart row across groups", async () => {
+  const {twoRowHeight} = await import("./lib/embedLayout.js");
+  const root = document.createElement("main");
+  root.innerHTML = '<div class="plot-grid"><i></i><i></i></div><div class="plot-grid"><i></i><i></i><i></i></div>';
+  const rects = [[100, 300], [100, 315], [0, 0], [355, 581.5], [601, 780]];
+  [...root.querySelectorAll("i")].forEach((el, index) => {
+    const [top, bottom] = rects[index];
+    el.getBoundingClientRect = () => ({top, bottom});
+  });
+  expect(twoRowHeight(root)).toBe(582);
+});
+
+it("sends changed layout heights to the parent and disconnects on unmount", async () => {
+  const {reportLayout} = await import("./lib/embedLayout.js");
+  const parent = {postMessage: vi.fn()};
+  const disconnect = vi.fn();
+  let resize;
+  vi.stubGlobal("parent", parent);
+  vi.stubGlobal("ResizeObserver", class {
+    constructor(callback) { resize = callback; }
+    observe() {}
+    disconnect = disconnect;
+  });
+  const root = document.createElement("main");
+  root.getBoundingClientRect = () => ({top: 0, height: 320});
+  const action = reportLayout(root);
+  resize();
+  expect(parent.postMessage).toHaveBeenCalledTimes(1);
+  root.getBoundingClientRect = () => ({top: 0, height: 540});
+  resize();
+  expect(parent.postMessage).toHaveBeenLastCalledWith({type: "envloop.dashboard.layout", height: 540}, location.origin);
+  action.destroy();
+  expect(disconnect).toHaveBeenCalledTimes(2);
 });

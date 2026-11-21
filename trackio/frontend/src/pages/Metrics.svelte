@@ -71,7 +71,7 @@
   const refreshTask = createPollingTask();
   const MAX_BATCH_RUNS = 64;
 
-  let colorMap = $derived(buildColorMap(allRuns));
+  let colorMap = $derived(buildColorMap(allRuns, {embedded}));
 
   let metricGroups = $derived.by(() => {
     let filtered = metricFilter

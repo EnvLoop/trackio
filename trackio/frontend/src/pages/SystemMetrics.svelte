@@ -45,7 +45,7 @@
   let refreshTimer = null;
   const refreshTask = createPollingTask();
 
-  let runColorMap = $derived(buildColorMap(allRuns.length ? allRuns : selectedRuns));
+  let runColorMap = $derived(buildColorMap(allRuns.length ? allRuns : selectedRuns, {embedded}));
 
   let metricGroups = $derived(groupMetricsByPrefix(metricNames));
   let groupNames = $derived(Object.keys(metricGroups));
