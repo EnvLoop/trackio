@@ -23,9 +23,9 @@ class CustomBuildHook(BuildHookInterface):
 
         root = Path(self.root)
         frontend = root / "trackio" / "frontend"
-        dist_index = frontend / "dist" / "index.html"
+        dist = frontend / "dist"
         if (
-            dist_index.is_file()
+            all((dist / name).is_file() for name in ("index.html", "embed.html"))
             and os.environ.get("TRACKIO_FRONTEND_FORCE_REBUILD") != "1"
         ):
             return
@@ -35,7 +35,7 @@ class CustomBuildHook(BuildHookInterface):
 
         if not shutil.which("npm"):
             raise RuntimeError(
-                "The Trackio dashboard frontend is not built (trackio/frontend/dist/index.html "
+                "The Trackio dashboard frontend is not built (a trackio/frontend/dist HTML entry "
                 "is missing) and npm is not available. Install Node.js and npm, then run "
                 "`cd trackio/frontend && npm ci && npm run build`, or set SKIP_FRONTEND_BUILD=1 "
                 "only if dist/ was produced another way."

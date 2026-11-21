@@ -25,6 +25,7 @@ async function _detectStaticMode() {
 }
 
 export async function isStaticMode() {
+  if (window.__trackio_embed === true) return false;
   if (_staticMode !== null) return _staticMode;
   if (!_staticModePromise) {
     _staticModePromise = _detectStaticMode().then((result) => {
@@ -52,14 +53,17 @@ function getOauthSessionHeader() {
 
 export async function callApi(apiName, params = {}, requestOptions = {}) {
   const cleanApiName = apiName.startsWith("/") ? apiName.slice(1) : apiName;
+  const embedded = window.__trackio_embed === true;
+  if (embedded && !["get_embed_context", "get_logs_batch", "get_system_logs_batch"].includes(cleanApiName)) {
+    throw new Error("Unsupported read-only Dashboard action");
+  }
   const url = `${BASE}/api/${cleanApiName}`;
   const resp = await fetch(url, {
     method: "POST",
-    credentials: "include",
+    credentials: embedded ? "same-origin" : "include",
     headers: {
       "Content-Type": "application/json",
-      ...getOauthSessionHeader(),
-      ...getWriteTokenHeader(),
+      ...(embedded ? {} : { ...getOauthSessionHeader(), ...getWriteTokenHeader() }),
     },
     body: JSON.stringify(params),
     signal: requestOptions.signal,

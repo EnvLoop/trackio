@@ -49,3 +49,21 @@ def test_source_archive_wheel_keeps_dashboard_without_frontend_build_inputs(
         "trackio/frontend/dist/index.html",
         "trackio/frontend/dist/assets/dashboard.js",
     }
+
+
+def test_cached_standalone_dashboard_still_builds_new_embed(tmp_path, monkeypatch):
+    import hatch_build
+
+    frontend = tmp_path / "trackio/frontend"
+    (frontend / "dist").mkdir(parents=True)
+    (frontend / "dist/index.html").write_text("<title>standalone</title>")
+    (frontend / "package.json").write_text("{}")
+    monkeypatch.delenv("SKIP_FRONTEND_BUILD", raising=False)
+    commands = []
+    monkeypatch.setattr(
+        hatch_build, "_run_npm", lambda args, cwd: commands.append(args)
+    )
+    monkeypatch.setattr(hatch_build.shutil, "which", lambda name: "/bin/npm")
+    hook = hatch_build.CustomBuildHook(str(tmp_path), {}, None, None, "", "wheel")
+    hook.initialize("standard", {})
+    assert commands == [["ci"], ["run", "build"]]

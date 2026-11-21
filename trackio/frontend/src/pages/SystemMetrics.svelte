@@ -20,6 +20,7 @@
 
   let {
     project = null,
+    embedded = false,
     selectedRuns = [],
     allRuns = [],
     smoothing = 5,
@@ -40,6 +41,7 @@
   const MAX_BATCH_RUNS = 64;
 
   let rawDataCache = new Map();
+  let truncated = $state(false);
   let refreshTimer = null;
   const refreshTask = createPollingTask();
 
@@ -147,6 +149,7 @@
   }
 
   function processFromCache() {
+    truncated = selectedRuns.some(run => rawDataCache.get(run.id ?? run.name)?.truncated);
     if (!project || selectedRuns.length === 0) {
       systemData = [];
       metricNames = [];
@@ -158,7 +161,7 @@
 
     for (const run of selectedRuns) {
       const runKey = run.id ?? run.name;
-      const logs = rawDataCache.get(runKey);
+      const logs = rawDataCache.get(runKey)?.logs;
       if (!logs || logs.length === 0) continue;
 
       const firstTs = new Date(logs[0].timestamp).getTime();
@@ -198,7 +201,7 @@
       try {
         return await getSystemLogsBatch(projectName, runs, requestOptions);
       } catch (e) {
-        if (!isMissingEndpointError(e)) throw e;
+        if (embedded || !isMissingEndpointError(e)) throw e;
         batchEndpointAvailable = false;
       }
     }
@@ -257,12 +260,16 @@
         if (signal.aborted || requestedProject !== project) return;
         for (const entry of batch) {
           const runKey = entry.run_id ?? entry.run;
-          rawDataCache.set(runKey, entry.logs);
+          rawDataCache.set(runKey, entry);
           fetched = true;
         }
         loadError = null;
       } catch (e) {
         if (e?.name === "AbortError") return;
+        if (embedded) {
+          loadError = e.message || "Unable to load system metrics";
+          return;
+        }
         console.error("Failed to load system metric logs:", e);
         if (!hasLoaded) {
           loadError = e && e.message ? e.message : "Failed to load system metrics";
@@ -278,8 +285,12 @@
     hasLoaded = true;
   }
 
-  async function refreshCachedRuns() {
-    if (!realtimeEnabled) return;
+  export function refresh() {
+    return refreshCachedRuns(true);
+  }
+
+  async function refreshCachedRuns(force = false) {
+    if (!force && !realtimeEnabled) return;
     if (!project || selectedRuns.length === 0) return;
     if (isTabHidden()) return;
     if (isRateLimitCooldownActive()) return;
@@ -298,8 +309,8 @@
           const runKey = entry.run_id ?? entry.run;
           const logs = entry.logs;
           const prev = rawDataCache.get(runKey);
-          if (!prev || logsHaveNewData(prev, logs)) {
-            rawDataCache.set(runKey, logs);
+          if (embedded || !prev || prev.truncated !== entry.truncated || logsHaveNewData(prev.logs, logs)) {
+            rawDataCache.set(runKey, entry);
             changed = true;
           }
         }
@@ -311,7 +322,8 @@
       });
     } catch (e) {
       if (e?.name !== "AbortError") {
-        console.error("Failed to refresh system metric logs:", e);
+        if (embedded) loadError = e.message || "Unable to load system metrics";
+        else console.error("Failed to refresh system metric logs:", e);
       }
     }
   }
@@ -518,8 +530,10 @@
 </script>
 
 <div class="system-page">
-  {#if !appBootstrapReady || (!hasLoaded && !loadError)}
-    <LoadingTrackio />
+  {#if embedded && truncated}<p role="status">System metric history was truncated. Showing the latest available observations.</p>{/if}
+  {#if embedded && loadError}<p role="alert">{loadError}</p>
+  {:else if !appBootstrapReady || (!hasLoaded && !loadError)}
+    {#if embedded}<p role="status">Loading metrics…</p>{:else}<LoadingTrackio />{/if}
   {:else if loadError && !hasLoaded}
     <div class="empty-state">
       <h2>Unable to load system metrics</h2>
@@ -537,6 +551,8 @@
       <h2>No run selected</h2>
       <p>Select one or more runs in the sidebar.</p>
     </div>
+  {:else if embedded && systemData.length === 0}
+    <p>No system metrics were recorded for the selected series.</p>
   {:else if systemData.length === 0}
     <div class="empty-state">
       <h2>No System Metrics Available</h2>

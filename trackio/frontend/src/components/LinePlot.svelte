@@ -1,5 +1,6 @@
 <script>
   import { onMount, tick } from "svelte";
+  import { onThemeChange } from "../lib/theme.js";
   import embed from "vega-embed";
   import * as vega from "vega";
   import { buildColorSpecKey } from "../lib/dataProcessing.js";
@@ -379,6 +380,7 @@
           embed(target, spec, {
             actions: false,
             renderer: "canvas",
+            ast: window.__trackio_embed === true,
           }),
         target,
       );
@@ -583,6 +585,10 @@
     });
     ro.observe(container);
     return () => ro.disconnect();
+  });
+
+  onMount(() => {
+    if (window.__trackio_embed === true) return onThemeChange(() => void fullRender());
   });
 
   onMount(() => {
