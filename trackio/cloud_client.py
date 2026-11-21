@@ -10,6 +10,7 @@ import time
 import uuid
 import warnings
 from collections import deque
+from contextlib import contextmanager
 from itertools import islice
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -26,7 +27,10 @@ MAX_BATCH_EVENTS = 256
 MAX_BATCH_BYTES = 1024 * 1024
 BATCH_JOURNAL_RESERVE = 16 * 1024
 DELIVERY_STATUS_RESERVE = 192
+RECEIPT_WRITE_WINDOW = 0.05
 EVENT_FILE_NAME = re.compile(r"[0-9]+-[0-9a-f]{32}\.json")
+SINGLE_EVENT_SUFFIX = ".single.json"
+CONTROL_FILES = {"delivery-status", "dropped-count"}
 
 CONFIG_FIELDS = frozenset(
     {
@@ -47,6 +51,14 @@ CONFIG_FIELDS = frozenset(
         "model/num_parameters",
     }
 )
+
+
+def _valid_metric_key(key):
+    return (
+        isinstance(key, str)
+        and 0 < len(key) <= 256
+        and all(ord(char) >= 32 for char in key)
+    )
 
 
 class CloudConfig(dict):
@@ -81,18 +93,19 @@ class CloudConfig(dict):
         selected = self.selected({**(values or {}), **kwargs})
         if not selected:
             return
-        try:
-            with self.run.lock:
-                if self.run.closed:
-                    return
-                super().update(selected)
-                self.run._write(
-                    self.run.directory / "config.pending", self.selected(self)
-                )
-        except (OSError, BufferError):
-            self.run._record_gap()
-            return
-        self.run._send()
+        with self.run._admitting() as admitted:
+            if not admitted:
+                return
+            try:
+                with self.run.lock:
+                    super().update(selected)
+                    self.run._write(
+                        self.run.directory / "config.pending", self.selected(self)
+                    )
+            except (OSError, BufferError):
+                self.run._record_gap()
+                return
+            self.run._send()
 
 
 class CloudRun(WorkspaceRunMixin, RichCloudRun):
@@ -139,8 +152,16 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
         self.owns_transport = transport is None
         self.lock = threading.RLock()
         self.flush_lock = threading.Lock()
+        self.progress = threading.Condition()
+        self._closing = False
+        self._admissions = 0
+        self._local_admission = threading.local()
         self.config = CloudConfig(self)
+        self.config_path = self.directory / "config.pending"
         self.event_batch_path = self.directory / "event-batch.pending"
+        self._pending_records = set(self.directory.glob("*.json"))
+        self._config_pending = self.config_path.exists()
+        self._batch_pending = self.event_batch_path.exists()
         self.state_path = self.directory / "state"
         if self.state_path.exists():
             self.state = json.loads(self.state_path.read_text())
@@ -166,16 +187,58 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
         finally:
             os.close(descriptor)
 
+    @contextmanager
+    def _admitting(self):
+        if getattr(self._local_admission, "active", False):
+            yield True
+            return
+        with self.progress:
+            admitted = not self._closing and not self.closed
+            if admitted:
+                self._admissions += 1
+                self._local_admission.active = True
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                self._local_admission.active = False
+                with self.progress:
+                    self._admissions -= 1
+                    if not self._admissions and self._closing:
+                        self.closed = True
+                    self.progress.notify_all()
+
     def _write(self, path, payload):
+        if path.suffix == ".json" or path == self.config_path:
+            with self._admitting() as admitted:
+                if not admitted:
+                    raise RuntimeError("RUN_CLOSED")
+                self._write_file(path, payload)
+        else:
+            self._write_file(path, payload)
+
+    def _spool_size(self):
+        total = 0
+        for path in self.directory.iterdir():
+            try:
+                metadata = path.stat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(metadata.st_mode):
+                total += metadata.st_size
+        return total
+
+    def _write_file(self, path, payload):
         encoded = json.dumps(payload, allow_nan=False, separators=(",", ":"))
-        previous_size = path.stat().st_size if path.exists() else 0
-        limit = self.max_bytes
-        if path == self.event_batch_path:
-            limit -= min(DELIVERY_STATUS_RESERVE, self.max_bytes // 4)
-        elif path.name not in {"state", "delivery-status"}:
-            limit -= min(BATCH_JOURNAL_RESERVE, self.max_bytes // 4)
-        if self._spool_size() - previous_size + len(encoded.encode()) > limit:
-            raise BufferError("METRICS_SPOOL_FULL")
+        if path.name not in CONTROL_FILES:
+            previous_size = path.stat().st_size if path.exists() else 0
+            limit = self.max_bytes
+            if path == self.event_batch_path:
+                limit -= min(DELIVERY_STATUS_RESERVE, self.max_bytes // 4)
+            elif path != self.state_path:
+                limit -= min(BATCH_JOURNAL_RESERVE, self.max_bytes // 4)
+            if self._spool_size() - previous_size + len(encoded.encode()) > limit:
+                raise BufferError("METRICS_SPOOL_FULL")
         temporary = path.with_suffix("." + uuid.uuid4().hex + ".tmp")
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
@@ -184,9 +247,40 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
+            self._set_pending(path, present=True)
             self._sync_directory()
         finally:
             temporary.unlink(missing_ok=True)
+
+    def _set_pending(self, path, *, present):
+        with self.progress:
+            if path == self.config_path:
+                self._config_pending = present
+            elif path == self.event_batch_path:
+                self._batch_pending = present
+            elif path.suffix == ".json":
+                if present:
+                    self._pending_records.add(path)
+                else:
+                    self._pending_records.discard(path)
+            else:
+                return
+            self.progress.notify_all()
+
+    def _unlink_pending(self, path):
+        path.unlink(missing_ok=True)
+        self._set_pending(path, present=False)
+        self._sync_directory()
+
+    def _freeze_single_event(self, path):
+        if path.name.endswith(SINGLE_EVENT_SUFFIX):
+            return path
+        frozen = path.with_suffix(SINGLE_EVENT_SUFFIX)
+        path.rename(frozen)
+        with self.progress:
+            self._pending_records.discard(path)
+            self._pending_records.add(frozen)
+        return frozen
 
     def log(self, metrics, step=None):
         if not isinstance(metrics, dict) or not metrics:
@@ -222,9 +316,7 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
             values = {}
             for key, value in metrics.items():
                 if (
-                    not isinstance(key, str)
-                    or not key
-                    or len(key) > 256
+                    not _valid_metric_key(key)
                     or type(value) not in (int, float)
                     or not math.isfinite(value)
                 ):
@@ -271,12 +363,14 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
             return stopped is not None and stopped.is_set()
 
         with self.flush_lock:
-            config_path = self.directory / "config.pending"
+            config_path = self.config_path
             with self.lock:
                 if cancelled():
                     return
                 self._collect_spool_objects()
                 config = config_path.read_bytes() if config_path.exists() else None
+            if cancelled():
+                return
             if config is not None:
                 response = self._request(
                     "put", self.endpoint + "/config", json=json.loads(config)
@@ -286,7 +380,7 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
                     if cancelled():
                         return
                     if config_path.exists() and config_path.read_bytes() == config:
-                        config_path.unlink()
+                        self._unlink_pending(config_path)
 
             with self.lock:
                 if cancelled():
@@ -315,13 +409,17 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
                         journal, events = self._prepare_event_batch(
                             path, payload, paths
                         )
+                if cancelled():
+                    return
                 if "record" in payload:
                     self._flush_record(payload)
                     with self.lock:
                         if cancelled():
                             return
-                        path.unlink(missing_ok=True)
+                        self._unlink_pending(path)
                         self._collect_spool_objects()
+                elif journal is None:
+                    self._flush_single_event(path, payload, cancelled)
                 else:
                     self._flush_event_batch(journal, events, cancelled)
 
@@ -345,8 +443,16 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
             )
         return size
 
+    @staticmethod
+    def _can_group(path, events):
+        return not path.name.endswith(SINGLE_EVENT_SUFFIX) and all(
+            _valid_metric_key(key) for event in events for key in event["metrics"]
+        )
+
     def _prepare_event_batch(self, path, payload, paths):
         first_events = payload["events"]
+        if not self._can_group(path, first_events):
+            return None, first_events
         events = list(first_events)
         batch_paths = [path.name]
         batch_id = "sdk-" + uuid.uuid4().hex
@@ -360,6 +466,8 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
             if "record" in next_payload:
                 break
             next_events = next_payload["events"]
+            if not self._can_group(next_path, next_events):
+                break
             next_size = size + self._event_bytes(next_events)
             if (
                 len(events) + len(next_events) > MAX_BATCH_EVENTS
@@ -370,20 +478,16 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
             batch_paths.append(next_path.name)
             events.extend(next_events)
 
+        if len(batch_paths) == 1:
+            return None, first_events
         journal = {"batch_id": batch_id, "paths": batch_paths, "acknowledged": False}
-        if len(batch_paths) > 1:
-            try:
-                self._write(self.event_batch_path, journal)
-            except BufferError:
-                batch_paths = [path.name]
-            else:
-                for _ in range(len(batch_paths) - 1):
-                    paths.popleft()
-                return journal, events
-
-        journal.update(batch_id=payload["batch_id"], paths=batch_paths)
-        self._write(self.event_batch_path, journal)
-        return journal, first_events
+        try:
+            self._write(self.event_batch_path, journal)
+        except BufferError:
+            return None, first_events
+        for _ in range(len(batch_paths) - 1):
+            paths.popleft()
+        return journal, events
 
     def _read_batch_journal(self):
         if not self.event_batch_path.exists():
@@ -424,27 +528,39 @@ class CloudRun(WorkspaceRunMixin, RichCloudRun):
         ):
             raise RuntimeError("INVALID_COMMIT_ACK")
 
+    def _post_events(self, payload):
+        response = self._request("post", self.endpoint + "/events", json=payload)
+        self._check_ack(response, "batch_id", payload["batch_id"])
+
+    def _flush_single_event(self, path, payload, cancelled):
+        with self.lock:
+            if cancelled():
+                return
+            frozen = self._freeze_single_event(path)
+            self._sync_directory()
+        if cancelled():
+            return
+        self._post_events(payload)
+        with self.lock:
+            if not cancelled():
+                self._unlink_pending(frozen)
+
     def _flush_event_batch(self, journal, events, cancelled):
         if cancelled():
             return
         if events is not None:
-            batch_id = journal["batch_id"]
-            response = self._request(
-                "post",
-                self.endpoint + "/events",
-                json={"batch_id": batch_id, "events": events},
-            )
-            self._check_ack(response, "batch_id", batch_id)
+            self._post_events({"batch_id": journal["batch_id"], "events": events})
         with self.lock:
             if cancelled():
                 return
             if events is not None:
                 self._write(self.event_batch_path, {**journal, "acknowledged": True})
-            for name in journal["paths"]:
-                (self.directory / name).unlink(missing_ok=True)
+            paths = [self.directory / name for name in journal["paths"]]
+            for path in paths:
+                path.unlink(missing_ok=True)
+                self._set_pending(path, present=False)
             self._sync_directory()
-            self.event_batch_path.unlink()
-            self._sync_directory()
+            self._unlink_pending(self.event_batch_path)
 
     def _request(self, method, endpoint, **kwargs):
         send = getattr(self.transport, method)
@@ -495,24 +611,35 @@ class ManagedCloudRun(CloudRun):
         super().__init__(*args, **kwargs)
         self.wake = threading.Event()
         self.stopped = threading.Event()
-        self.progress = threading.Condition(self.lock)
         self._finishers = 0
         self._worker_retired = False
         self._last_error = None
-        self.delivery_status = {"committed": False, "pending": 0, "dropped": 0}
+        self._gap_lock = threading.Lock()
+        self._receipt_lock = threading.Lock()
+        self._receipt_sequence = 0
+        self._latest_receipt = (0, False)
+        self._monitors_stopping = False
         self.monitors = []
         self.system_started = False
-        self.closed = False
-        previous = self.directory / "delivery-status"
-        if previous.exists():
-            dropped = json.loads(previous.read_text())["dropped"]
-            if type(dropped) is not int or dropped < 0:
-                raise ValueError("INVALID_DELIVERY_RECEIPT")
-            self.delivery_status["dropped"] = dropped
+        self._receipt_path = self.directory / "delivery-status"
+        self._gap_path = self.directory / "dropped-count"
+        dropped = self._read_dropped_count()
+        self.delivery_status = {"committed": False, "pending": 0, "dropped": dropped}
         self._start_worker()
 
-    def _start_worker(self):
-        self.worker = threading.Thread(target=self._pump, daemon=True)
+    def _read_dropped_count(self):
+        dropped = []
+        if self._receipt_path.exists():
+            dropped.append(json.loads(self._receipt_path.read_text())["dropped"])
+        if self._gap_path.exists():
+            dropped.append(json.loads(self._gap_path.read_text()))
+        if any(type(count) is not int or count < 0 for count in dropped):
+            raise ValueError("INVALID_DELIVERY_RECEIPT")
+        return max(dropped, default=0)
+
+    def _start_worker(self, *, reopen=False):
+        self._worker_retired = False
+        self.worker = threading.Thread(target=self._pump, args=(reopen,), daemon=True)
         self.worker.start()
         self.wake.set()
 
@@ -563,24 +690,44 @@ class ManagedCloudRun(CloudRun):
     def _send(self):
         self.wake.set()
 
-    def _pump(self):
+    def _pump(self, reopen):
+        transport = self.transport
+        try:
+            if reopen and self.owns_transport:
+                transport = self._new_transport()
+                self.transport = transport
+            self._send_until_stopped()
+        except (OSError, RuntimeError, ValueError) as error:
+            with self.progress:
+                self._last_error = self._error_category(error)
+        finally:
+            with self.progress:
+                if self.worker is threading.current_thread():
+                    self._worker_retired = True
+                self.progress.notify_all()
+            if self.owns_transport:
+                transport.close()
+
+    def _send_until_stopped(self):
         while True:
             self.wake.wait(1)
             self.wake.clear()
             with self.progress:
                 if self.stopped.is_set():
                     self._worker_retired = True
-                    transport = self.transport
-                    break
+                    return
             category = None
             try:
                 self._flush(self.stopped)
             except (
                 httpx2.HTTPError,
                 OSError,
+                BufferError,
                 RuntimeError,
                 ValueError,
                 KeyError,
+                TypeError,
+                AttributeError,
             ) as error:
                 category = self._error_category(error)
             with self.progress:
@@ -589,8 +736,6 @@ class ManagedCloudRun(CloudRun):
                 self.progress.notify_all()
             if category:
                 self.stopped.wait(1)
-        if self.owns_transport:
-            transport.close()
 
     @staticmethod
     def _error_category(error):
@@ -609,37 +754,62 @@ class ManagedCloudRun(CloudRun):
             "INVALID_COMMIT_ACK",
             "INVALID_RECORD_ACK",
             "INVALID_OBJECT_ACK",
+            "INVALID_RESOURCE_ACK",
         ):
             return "invalid_ack"
         return "spool"
 
     def log(self, metrics, step=None):
-        with self.lock:
-            if not self.closed:
-                super().log(metrics, step)
+        with self._admitting() as admitted:
+            if admitted:
+                with self.lock:
+                    super().log(metrics, step)
+
+    def log_system(self, metrics):
+        with self._admitting() as admitted:
+            if admitted:
+                super().log_system(metrics)
 
     def _log(self, *args):
         try:
-            with self.lock:
-                if not self.closed:
-                    super()._log(*args)
+            super()._log(*args)
         except (OSError, BufferError, ValueError):
             self._record_gap()
 
     def queue_record(self, *args, **kwargs):
-        try:
-            super().queue_record(*args, **kwargs)
-        except ValueError:
-            self._record_gap()
+        with self._admitting() as admitted:
+            if admitted:
+                try:
+                    super().queue_record(*args, **kwargs)
+                except ValueError:
+                    self._record_gap()
 
     def _record_gap(self):
-        with self.lock:
-            self.delivery_status["dropped"] += 1
+        with self._gap_lock:
+            with self.progress:
+                dropped = self.delivery_status["dropped"] + 1
+                self.delivery_status.update(committed=False, dropped=dropped)
+            try:
+                self._write(self._gap_path, dropped)
+            except (OSError, BufferError):
+                pass
         warnings.warn(
             "TRACKIO_METRICS_GAP: metrics could not be durably buffered",
             RuntimeWarning,
             stacklevel=2,
         )
+
+    def _stop_monitors(self, monitors, deadline):
+        try:
+            for monitor in monitors:
+                try:
+                    monitor.stop(timeout=max(0, min(2, deadline - time.monotonic())))
+                except Exception:
+                    self._record_gap()
+        finally:
+            with self.progress:
+                self._monitors_stopping = False
+                self.progress.notify_all()
 
     def finish(self, timeout=5):
         if (
@@ -649,38 +819,44 @@ class ManagedCloudRun(CloudRun):
         ):
             raise ValueError("INVALID_FINISH_TIMEOUT")
         deadline = time.monotonic() + timeout
+        delivery_deadline = deadline - min(timeout / 2, RECEIPT_WRITE_WINDOW)
         with self.progress:
-            self.closed = True
-            monitors, self.monitors = self.monitors, []
+            self._closing = True
+            if not self._admissions:
+                self.closed = True
+            if self.monitors and not self._monitors_stopping:
+                monitors, self.monitors = self.monitors, []
+                self._monitors_stopping = True
+                threading.Thread(
+                    target=self._stop_monitors, args=(monitors, deadline), daemon=True
+                ).start()
             self._finishers += 1
-            if timeout > 0 and self._pending_count():
-                self.stopped.clear()
-                if self._worker_retired:
-                    if self.owns_transport:
-                        self.transport = self._new_transport()
-                    self._worker_retired = False
-                    self._start_worker()
-                else:
-                    self.wake.set()
-        try:
-            for monitor in monitors:
-                try:
-                    monitor.stop(timeout=max(0, min(2, deadline - time.monotonic())))
-                except Exception:
-                    self._record_gap()
-            with self.progress:
-                while self._pending_count():
-                    remaining = deadline - time.monotonic()
+            try:
+                if timeout > 0 and (self._pending_count() or self._admissions):
+                    self.stopped.clear()
+                    if self._worker_retired:
+                        self._start_worker(reopen=True)
+                    else:
+                        self.wake.set()
+                while (
+                    self._pending_count() or self._admissions or self._monitors_stopping
+                ):
+                    remaining = delivery_deadline - time.monotonic()
                     if remaining <= 0:
                         break
-                    self.progress.wait(min(remaining, 0.05))
-        finally:
-            with self.progress:
+                    self.progress.wait(min(remaining, threading.TIMEOUT_MAX))
+                status = self._delivery_snapshot()
+                self._receipt_sequence += 1
+                sequence = self._receipt_sequence
+            finally:
                 self._finishers -= 1
                 if not self._finishers:
                     self.stopped.set()
                     self.wake.set()
-                status = self._delivery_receipt()
+        if timeout == 0:
+            status = self._persist_receipt(status, sequence, deadline)
+        else:
+            status = self._await_receipt(status, sequence, deadline)
         if status["pending"]:
             warnings.warn(
                 "TRACKIO_METRICS_DELAYED: pending metrics remain in the private spool",
@@ -690,30 +866,73 @@ class ManagedCloudRun(CloudRun):
         return status
 
     def _pending_count(self):
-        pending = len(list(self.directory.glob("*.json")))
-        if not pending and self.event_batch_path.exists():
-            pending = 1
-        return pending + int((self.directory / "config.pending").exists())
+        records = len(self._pending_records) or int(self._batch_pending)
+        return records + int(self._config_pending)
 
-    def _delivery_receipt(self):
+    def _delivery_snapshot(self):
         pending = self._pending_count()
         dropped = self.delivery_status["dropped"]
+        unresolved = self._admissions or self._monitors_stopping
         status = {
-            "committed": not pending and not dropped,
+            "committed": not pending and not dropped and not unresolved,
             "pending": pending,
             "dropped": dropped,
         }
         if pending:
             status["error_category"] = self._last_error or "timeout"
+        elif unresolved:
+            status["error_category"] = "timeout"
         elif dropped:
             status["error_category"] = "dropped"
+        return status
+
+    @staticmethod
+    def _receipt_timeout(status):
+        if status["committed"]:
+            return {**status, "committed": False, "error_category": "timeout"}
+        return status
+
+    @staticmethod
+    def _time_left(deadline):
+        return max(0, min(threading.TIMEOUT_MAX, deadline - time.monotonic()))
+
+    def _await_receipt(self, status, sequence, deadline):
+        saved = threading.Event()
+        result = []
+
+        def write_receipt():
+            result.append(self._persist_receipt(dict(status), sequence, deadline))
+            saved.set()
+
+        threading.Thread(target=write_receipt, daemon=True).start()
+        if saved.wait(self._time_left(deadline)):
+            return result[0]
+        return self._receipt_timeout(status)
+
+    def _persist_receipt(self, status, sequence, deadline):
+        if not self._receipt_lock.acquire(timeout=self._time_left(deadline)):
+            return self._receipt_timeout(status)
         try:
-            self._write(self.directory / "delivery-status", status)
-        except (OSError, BufferError):
-            self._record_gap()
-            status.update(committed=False, dropped=dropped + 1, error_category="spool")
-        self.delivery_status = status
-        return dict(status)
+            previous_sequence, previous_committed = self._latest_receipt
+            if sequence <= previous_sequence:
+                return status if previous_committed else self._receipt_timeout(status)
+            try:
+                self._write(self._receipt_path, status)
+            except (OSError, BufferError):
+                self._record_gap()
+                with self.progress:
+                    status.update(
+                        committed=False,
+                        dropped=self.delivery_status["dropped"],
+                        error_category="spool",
+                    )
+            self._latest_receipt = (sequence, status["committed"])
+            with self.progress:
+                if self.delivery_status["dropped"] <= status["dropped"]:
+                    self.delivery_status = dict(status)
+            return status
+        finally:
+            self._receipt_lock.release()
 
 
 def init_from_context(path, *, config=None, system=None):

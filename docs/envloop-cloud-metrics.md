@@ -106,13 +106,17 @@ in asynchronous batches of up to 256 events and 1 MiB. It preserves each event's
 identity, groups retries under the original batch ID, and checkpoints the matching
 commit ACK before removing spool files. Rich records retain their queue order.
 
-`run.finish(timeout=...)` stops managed sampling and waits up to the delivery
-deadline. Its returned status is also written to `delivery-status` in the spool.
-`pending` counts queued records and config still awaiting delivery or cleanup.
-`dropped` counts gaps recorded by the SDK. `committed` is true when both counts
-are zero and the receipt was saved. An incomplete status also includes a safe
-`error_category` such as `timeout`, `transport`, `permission`, `rejected`,
-`invalid_ack`, `spool` or `dropped`.
+`run.finish(timeout=...)` closes admission and stops managed sampling. A positive
+timeout bounds the wait for delivery, monitor shutdown and the local
+`delivery-status` receipt. A zero timeout takes a local snapshot without waiting
+for delivery or monitor shutdown. `pending` counts queued records and config
+awaiting delivery or cleanup. The SDK persists detected gaps in the private spool,
+so reopening retains the `dropped` count even if the previous process exited
+before finish. `committed` is true when both counts are zero, admission and
+monitor shutdown have settled, and the receipt was saved. An incomplete status
+can have zero pending files while admission, monitor shutdown or receipt writing
+is still in progress. Its safe `error_category` can be `timeout`, `transport`,
+`permission`, `rejected`, `invalid_ack`, `spool` or `dropped`.
 
 To resume a pending delivery, call `run.finish(timeout=...)` again. Once the
 reporting process has exited, the controller can also reopen the same spool
