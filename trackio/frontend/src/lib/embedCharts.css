@@ -1,0 +1,7 @@
+main .plot-grid > .plot-container {
+  box-sizing: border-box;
+}
+
+main .system-page .plot-grid > .plot-container {
+  min-width: min(350px, 100%);
+}

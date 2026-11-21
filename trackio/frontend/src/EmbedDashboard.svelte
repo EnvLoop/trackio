@@ -3,6 +3,7 @@
   import { callApi } from "./lib/api.js";
   import { applyTheme, detectSystemTheme, isDark } from "./lib/theme.js";
   import { reportLayout } from "./lib/embedLayout.js";
+  import "./lib/embedCharts.css";
   import Metrics from "./pages/Metrics.svelte";
   import SystemMetrics from "./pages/SystemMetrics.svelte";
 

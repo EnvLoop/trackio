@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterEach, expect, it, vi } from "vitest";
 import { mount, unmount } from "svelte";
 
@@ -245,4 +246,21 @@ it("sends changed layout heights to the parent and disconnects on unmount", asyn
   expect(parent.postMessage).toHaveBeenLastCalledWith({type: "envloop.dashboard.layout", height: 540}, location.origin);
   action.destroy();
   expect(disconnect).toHaveBeenCalledTimes(2);
+});
+
+it.each(["metrics-page", "system-page"])("keeps native chart borders inside %s columns", async page => {
+  const rules = readFileSync("src/lib/embedCharts.css", "utf8");
+  const sheet = document.createElement("style");
+  sheet.textContent = rules;
+  document.head.append(sheet);
+  target = document.createElement("main");
+  target.innerHTML = '<div class="' + page + '"><div class="plot-grid"><div class="plot-container"></div></div></div>';
+  document.body.append(target);
+  try {
+    const chart = getComputedStyle(target.querySelector(".plot-container"));
+    expect(chart.boxSizing).toBe("border-box");
+    if (page === "system-page") expect(chart.minWidth).toBe("min(350px, 100%)");
+  } finally {
+    sheet.remove();
+  }
 });
