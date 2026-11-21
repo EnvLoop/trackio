@@ -264,3 +264,30 @@ it.each(["metrics-page", "system-page"])("keeps native chart borders inside %s c
     sheet.remove();
   }
 });
+
+it.each([
+  ["#view=system", "system", false],
+  ["#view=metrics", "metrics", false],
+  ["#view=unknown", "metrics", true],
+  ["", "metrics", true],
+])("keeps initial fragment %s on its scoped reader through refresh", async (fragment, view, showNavigation) => {
+  const originalUrl = location.href;
+  history.replaceState(null, "", location.pathname + fragment);
+  try {
+    vi.stubGlobal("__trackio_live", false);
+    setup(url => Response.json({data: url.endsWith("/get_embed_context")
+      ? {project: "project", readonly: true, runs: [{id: "a", name: "writer"}]}
+      : [{run_id: "a", logs: []}]}));
+    await render();
+    const batch = view === "system" ? "get_system_logs_batch" : "get_logs_batch";
+    const calls = () => fetch.mock.calls.map(([url]) => url);
+    await vi.waitFor(() => expect(calls()).toContain(base + "/api/" + batch));
+    expect(Boolean(target.querySelector('nav[aria-label="Metric categories"]'))).toBe(showNavigation);
+    const before = calls().length;
+    [...target.querySelectorAll("button")].find(button => button.textContent === "Refresh").click();
+    await vi.waitFor(() => expect(calls().slice(before)).toContain(base + "/api/" + batch));
+    expect(new Set(calls())).toEqual(new Set([base + "/api/get_embed_context", base + "/api/" + batch]));
+  } finally {
+    history.replaceState(null, "", originalUrl);
+  }
+});
