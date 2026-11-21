@@ -176,6 +176,7 @@
           embed(target, spec, {
             actions: false,
             renderer: "canvas",
+            ast: window.__trackio_embed === true,
           }),
         target,
       );

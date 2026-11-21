@@ -5,6 +5,7 @@ export default defineConfig({
   base: "/",
   plugins: [svelte()],
   build: {
+    rollupOptions: { input: ["index.html", "embed.html"] },
     chunkSizeWarningLimit: 1200,
   },
 });

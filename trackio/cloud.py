@@ -40,7 +40,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from trackio import cloud_server
+from trackio import cloud_dashboard, cloud_server
 from trackio.cloud_metrics import query_metrics, query_options
 from trackio.cloud_objects import MAX_OBJECT_BYTES
 from trackio.cloud_pools import validate_pool_sizes
@@ -907,6 +907,17 @@ def create_app(config, repository=None, *, objects=None):
                 raise ValueError("REQUEST_TOO_LARGE")
         return json.loads(content)
 
+    def dashboard_asset(request):
+        service(request)
+        return cloud_dashboard.asset(request.path_params["path"])
+
+    async def dashboard_query(request):
+        service(request)
+        payload = await body(request)
+        return JSONResponse(
+            await run_in_threadpool(cloud_dashboard.query, repository, payload)
+        )
+
     def ready(request):
         with repository.read_connection() as connection:
             connection.execute(select(repository.schema.c.version)).one()
@@ -930,7 +941,8 @@ def create_app(config, repository=None, *, objects=None):
                     "records",
                     "metric_query_v1",
                 ]
-                + (["objects"] if objects is not None else []),
+                + (["objects"] if objects is not None else [])
+                + (["dashboard_embed_v1"] if cloud_dashboard.available() else []),
             }
         )
 
@@ -1184,6 +1196,8 @@ def create_app(config, repository=None, *, objects=None):
         lifespan=lifespan,
         routes=[
             Route("/ready", ready),
+            Route("/v1/dashboard/assets/{path:path}", dashboard_asset),
+            Route("/v1/dashboard/query", dashboard_query, methods=["POST"]),
             Route("/v1/runs", bind_run, methods=["POST"]),
             Route("/v1/runs", forbidden),
             Route("/v1/runs/{run_id}/events", append, methods=["POST"]),

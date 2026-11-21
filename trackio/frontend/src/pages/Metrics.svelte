@@ -32,6 +32,7 @@
 
   let {
     project = null,
+    embedded = false,
     selectedRuns = [],
     allRuns = [],
     runConfigs = {},
@@ -58,11 +59,14 @@
   let singlePointMetrics = $state(new Set());
   let xLim = $state(null);
   let hasLoaded = $state(false);
+  let loadError = $state("");
+  let missingSteps = $state(false);
   let metricOrder = $state({});
   let dragState = $state({ group: null, index: -1 });
   let pageElement = $state(null);
 
   let rawDataCache = new Map();
+  let truncated = $state(false);
   let refreshTimer = null;
   const refreshTask = createPollingTask();
   const MAX_BATCH_RUNS = 64;
@@ -167,6 +171,7 @@
   }
 
   function processFromCache() {
+    truncated = selectedRuns.some(run => rawDataCache.get(run.id ?? run.name)?.truncated);
     if (!project || selectedRuns.length === 0) {
       masterData = [];
       metrics = [];
@@ -176,10 +181,14 @@
     }
 
     const allRows = [];
+    missingSteps = false;
     for (const run of selectedRuns) {
-      const logs = rawDataCache.get(run.id ?? run.name);
+      const logs = rawDataCache.get(run.id ?? run.name)?.logs;
       if (!logs) continue;
-      const result = processRunData(logs, run, smoothing, xAxis, logScaleX, logScaleY);
+      const needsSteps = embedded && xAxis === "step";
+      const visible = needsSteps ? logs.filter(row => row.step != null) : logs;
+      if (visible.length < logs.length) missingSteps = true;
+      const result = processRunData(visible, run, smoothing, xAxis, logScaleX, logScaleY);
       if (result) {
         allRows.push(...result.rows);
         xColumn = result.xColumn;
@@ -249,6 +258,7 @@
       return;
     }
 
+    loadError = "";
     const requestedProject = project;
     const requestedRuns = selectedRuns;
     const needFetch = requestedRuns.filter((run) => {
@@ -266,12 +276,13 @@
         if (signal.aborted || requestedProject !== project) return;
         for (const entry of batch) {
           const runKey = entry.run_id ?? entry.run;
-          rawDataCache.set(runKey, entry.logs);
+          rawDataCache.set(runKey, entry);
           fetched = true;
         }
       } catch (e) {
         if (e?.name === "AbortError") return;
-        console.error("Failed to load metric logs:", e);
+        if (embedded) loadError = e.message || "Unable to load metrics";
+        else console.error("Failed to load metric logs:", e);
       }
     }
 
@@ -281,8 +292,12 @@
     hasLoaded = true;
   }
 
-  async function refreshCachedRuns() {
-    if (!realtimeEnabled) return;
+  export function refresh() {
+    return refreshCachedRuns(true);
+  }
+
+  async function refreshCachedRuns(force = false) {
+    if (!force && !realtimeEnabled) return;
     if (!project || selectedRuns.length === 0) return;
     if (isTabHidden()) return;
     if (isRateLimitCooldownActive()) return;
@@ -301,19 +316,21 @@
           const runKey = entry.run_id ?? entry.run;
           const logs = entry.logs;
           const prev = rawDataCache.get(runKey);
-          if (!prev || logsHaveNewData(prev, logs)) {
-            rawDataCache.set(runKey, logs);
+          if (!prev || prev.truncated !== entry.truncated || logsHaveNewData(prev.logs, logs)) {
+            rawDataCache.set(runKey, entry);
             changed = true;
           }
         }
         if (changed) {
           processFromCache();
         }
+        loadError = "";
         hasLoaded = true;
       });
     } catch (e) {
       if (e?.name !== "AbortError") {
-        console.error("Failed to refresh metric logs:", e);
+        if (embedded) loadError = e.message || "Unable to load metrics";
+        else console.error("Failed to refresh metric logs:", e);
       }
     }
   }
@@ -436,8 +453,11 @@
 </script>
 
 <div class="metrics-page" bind:this={pageElement}>
-  {#if !appBootstrapReady || !hasLoaded}
-    <LoadingTrackio />
+  {#if embedded && truncated}<p role="status">Metric history was truncated. Showing the latest available observations.</p>{/if}
+  {#if missingSteps}<p role="status">Use the elapsed time axis to view observations without a step.</p>{/if}
+  {#if embedded && loadError}<p role="alert">{loadError}</p>
+  {:else if !appBootstrapReady || !hasLoaded}
+    {#if embedded}<p role="status">Loading metrics…</p>{:else}<LoadingTrackio />{/if}
   {:else if !project}
     <div class="empty-state">
       <h2>No projects</h2>
@@ -450,6 +470,8 @@
       <h2>No run selected</h2>
       <p>Select one or more runs in the sidebar.</p>
     </div>
+  {:else if embedded && masterData.length === 0}
+    {#if !missingSteps}<p>No experiment metrics were recorded for the selected series.</p>{/if}
   {:else if masterData.length === 0}
     <div class="empty-state">
       <h2>Start logging with Trackio</h2>
